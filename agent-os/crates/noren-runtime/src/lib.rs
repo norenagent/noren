@@ -4998,6 +4998,18 @@ cpu_ms_per_task = 5000
 
     #[test]
     fn docker_workspace_input_files_reject_path_traversal_and_land_inside_workspace() {
+        // The workspace is chowned to the unprivileged workspace uid, which
+        // needs root; skip cleanly elsewhere (same convention as the
+        // disk-limit test below).
+        let is_root = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+            .unwrap_or(false);
+        if !is_root {
+            eprintln!("skip: not root");
+            return;
+        }
         let scratch = tempdir().unwrap();
         let runner = DockerWorkspaceRunner::with_paths("docker", scratch.path());
         for bad in [

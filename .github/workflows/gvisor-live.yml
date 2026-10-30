@@ -100,4 +100,5 @@ jobs:
           NOREN_LIVE_RUNSC: /usr/local/bin/runsc
           NOREN_LIVE_GVISOR_ROOTFS: ${{ steps.rootfs.outputs.rootfs_dir }}
         run: |
-          cargo test -p noren-runtime --test live_gvisor -- --ignored live_gvisor_runner_dispatches_with_runsc
+          # runsc must configure cgroups, which a non-root runner user cannot do.
+          sudo -E env "PATH=$PATH" HOME="$HOME" cargo test -p noren-runtime --test live_gvisor -- --ignored live_gvisor_runner_dispatches_with_runsc
