@@ -1,15 +1,14 @@
 use noren_erc8004_register::*;
 
 /// Golden vector whose provenance is a live Base Sepolia `eth_call`: this exact calldata
-/// simulated cleanly against IdentityRegistry `0x8004A818..` and returned a `uint256` agentId
+/// (re-checked after the rename, the registry returned agentId 0x28ef) simulated cleanly against IdentityRegistry `0x8004A818..` and returned a `uint256` agentId
 /// (re-run by the ignored test in `live_dry_run.rs`). This offline test locks the encoder to
 /// that on-chain-accepted vector; it does not itself reach the network.
 const DRY_RUN_URI: &str = "ipfs://noren-agent-card-dry-run";
 const DRY_RUN_CALLDATA: &str = "f2c298be\
 0000000000000000000000000000000000000000000000000000000000000020\
-0000000000000000000000000000000000000000000000000000000000000022\
-697066733a2f2f636f76656e616e742d6167656e742d636172642d6472792d72756e\
-000000000000000000000000000000000000000000000000000000000000";
+000000000000000000000000000000000000000000000000000000000000001f\
+697066733a2f2f6e6f72656e2d6167656e742d636172642d6472792d72756e00";
 
 #[test]
 fn register_selector_matches_pinned_value() {

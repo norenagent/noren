@@ -69,8 +69,8 @@ jobs:
           COMMIT: ${{ steps.commit.outputs.sha }}
           REPOSITORY: ${{ github.repository }}
         run: |
-          # shellcheck disable=SC2016
           set -euo pipefail
+          # shellcheck disable=SC2016
           node --input-type=module -e '
             import { createHash } from "node:crypto";
             import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";

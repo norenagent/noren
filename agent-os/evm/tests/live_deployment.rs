@@ -23,14 +23,31 @@ fn eth_call(url: &str, to: &str, data: &str) -> String {
         "params": [{ "to": to, "data": data }, "latest"],
     });
     let out = Command::new("curl")
-        .args(["-s", "-m", "25", "-X", "POST", url, "-H", "content-type: application/json", "-d"])
+        .args([
+            "-s",
+            "-m",
+            "25",
+            "-X",
+            "POST",
+            url,
+            "-H",
+            "content-type: application/json",
+            "-d",
+        ])
         .arg(body.to_string())
         .output()
         .expect("curl must be installed");
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("RPC returned non-JSON");
-    assert!(parsed.get("error").is_none(), "RPC error: {}", parsed["error"]);
-    parsed["result"].as_str().expect("result is a hex string").to_lowercase()
+    assert!(
+        parsed.get("error").is_none(),
+        "RPC error: {}",
+        parsed["error"]
+    );
+    parsed["result"]
+        .as_str()
+        .expect("result is a hex string")
+        .to_lowercase()
 }
 
 /// Last 20 bytes of a 32-byte word, as a `0x` address.
