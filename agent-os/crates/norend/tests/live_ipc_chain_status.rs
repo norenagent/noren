@@ -152,7 +152,10 @@ async fn live_ipc_chain_status_configured_reports_ready() {
                 "NOREN_SETTLEMENT_CONTRACT",
                 "Cov1111111111111111111111111111111111111111",
             ),
-            ("NOREN_TOKEN_ADDRESS", "0x0000000000000000000000000000000000000001"),
+            (
+                "NOREN_TOKEN_ADDRESS",
+                "0x0000000000000000000000000000000000000001",
+            ),
         ],
     )
     .await;

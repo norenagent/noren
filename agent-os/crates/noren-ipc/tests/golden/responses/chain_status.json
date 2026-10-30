@@ -2,7 +2,7 @@
   "kind": "chain_status",
   "status": {
     "chain": "eip155:4663",
-    "cluster": "devnet",
+    "cluster": "mainnet",
     "rpc_url": null,
     "ws_url": null,
     "program_id": null,

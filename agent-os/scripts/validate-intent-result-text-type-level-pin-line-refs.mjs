@@ -47,10 +47,10 @@ const selector =
   'assert!(value["text"].is_string(), "text must be a string: {value}");';
 
 const docsRegex =
-  /- `text` \(string\): the result text the daemon returned\. The unsuffixed CLI prints this value directly at `main\.rs:2078`[^\n]*Pinned as a string by `main\.rs:(\d+)` — never an object or array\./;
+  /- `text` \(string\): the result text the daemon returned\. The unsuffixed CLI prints this value directly at `main\.rs:\d+`[^\n]*Pinned as a string by `main\.rs:(\d+)` — never an object or array\./;
 const docsLabel = "intent_result.text type-level pin citation";
 const docsTemplate =
-  '- `text` (string): the result text the daemon returned. The unsuffixed CLI prints this value directly at `main.rs:2078` … Pinned as a string by `main.rs:N` — never an object or array.';
+  '- `text` (string): the result text the daemon returned. The unsuffixed CLI prints this value directly at `main.rs:N` … Pinned as a string by `main.rs:N` — never an object or array.';
 
 const errors = [];
 const fail = (message) => errors.push(message);

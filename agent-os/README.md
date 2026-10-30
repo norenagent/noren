@@ -130,12 +130,11 @@ The Linux host, `runsc`, rootfs, and CI adoption contract is maintained internal
 | Trust and policy | `noren-identity`, `noren-attestation`, `noren-evm-signer`, `noren-permissions`, `noren-peer-auth`, `noren-audit`, `noren-budget` |
 | State and tools | `noren-memory`, `noren-tools`, `noren-llm`, `noren-mcp`, `noren-a2a`, `noren-acedata` |
 | Compositor | `noren-tui` |
-| Payments | `noren-x402`, `noren-loofta` |
+| Payments | `noren-x402` |
 | Settlement | `noren-settlement` |
 | Adapters | `noren-timeline-adapter` |
 | Multichain (Base/EVM, Robinhood Chain) | `noren-x402-signer-evm`, `noren-evm-firewall`, `noren-rwa-firewall`, `noren-spend-permission` |
 | Trading venues | `noren-robinhood` |
-| Data provenance | `noren-myrad` |
 | Enclaves | `noren-tee` |
 | Bonded operators | `noren-bond` |
 

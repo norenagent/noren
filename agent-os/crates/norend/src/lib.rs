@@ -57306,7 +57306,10 @@ budget_credits_per_hour = {credits}
             "NOREN_SETTLEMENT_CONTRACT",
             "0x00000000000000000000000000000000000000a1",
         );
-        std::env::set_var("NOREN_TOKEN_ADDRESS", "0xd7ccebb9a014a713879093979c7016db72486e62");
+        std::env::set_var(
+            "NOREN_TOKEN_ADDRESS",
+            "0xd7ccebb9a014a713879093979c7016db72486e62",
+        );
         let ready = chain_status_from_env();
         assert!(
             ready.ready,

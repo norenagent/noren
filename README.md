@@ -10,7 +10,7 @@ Every agent runs under a signed grant. Every action leaves a receipt in a hash-c
 - **x402 gateway and facilitator:** https://gateway.usenoren.xyz
 
 <!-- METRICS:START -->
-**Status.** Local control plane is real and live-tested (38 Rust crates, ~245k lines, 3334 source-discovered Rust tests including 456 live boundary tests). Production-grade sandboxing for hostile agent code and networked multi-peer operation are roadmap; payments settle in USDG on Robinhood Chain, while on-chain staking and credit metering are not built. See [BUILT.md](./BUILT.md) for the explicit honesty boundary.
+**Status.** Local control plane is real and live-tested (35 Rust crates, ~240k lines, 3245 source-discovered Rust tests including 455 live boundary tests). Production-grade sandboxing for hostile agent code and networked multi-peer operation are roadmap; the Robinhood Chain settlement program is deployed on mainnet (credits, staking, slashing, on-chain receipt anchoring), but its daemon-driven economic lifecycle is not yet production. See [BUILT.md](./BUILT.md) for the explicit honesty boundary.
 <!-- METRICS:END -->
 
 ## What works today

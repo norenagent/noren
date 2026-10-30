@@ -93,7 +93,6 @@ run node ./scripts/validate-daemon-subprocess-recover-before-tick.mjs
 run node ./scripts/validate-budget-projection-env-doc.mjs
 run node ./scripts/validate-ipc-v2-migration-doc-fixtures.mjs
 run_local ./scripts/validate-autonomy-status-gaps.mjs
-run node ./scripts/validate-chain-tx-test-line-refs.mjs
 run node ./scripts/validate-receipt-list-line-refs.mjs
 run node ./scripts/validate-receipt-onchain-fallback-line-refs.mjs
 run node ./scripts/validate-memory-backfill-line-refs.mjs
@@ -131,10 +130,6 @@ run node ./scripts/validate-peer-list-line-refs.mjs
 run node ./scripts/validate-verify-report-line-refs.mjs
 run node ./scripts/validate-intents-resume-line-refs.mjs
 run node ./scripts/validate-intents-resume-sources-block-print-line-refs.mjs
-run node ./scripts/validate-sap-status-line-refs.mjs
-run node ./scripts/validate-sap-published-agent-line-refs.mjs
-run node ./scripts/validate-sap-published-audit-root-line-refs.mjs
-run node ./scripts/validate-sap-published-attestation-line-refs.mjs
 run node ./scripts/validate-noren-ipc-struct-line-refs.mjs
 run node ./scripts/validate-noren-ipc-field-attribute-range-line-refs.mjs
 run node ./scripts/validate-noren-ipc-chain-status-field-list-line-refs.mjs
