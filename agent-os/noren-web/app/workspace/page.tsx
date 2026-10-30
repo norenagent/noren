@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { api, type AgentCodeResult, type WorkspaceRun } from "@/lib/api";
 import { friendlyError, Tile } from "@/lib/ui";
-import { PageHeader } from "../components/PageHeader";
 import { buildPreviewDocument } from "@/lib/preview";
 import { Turnstile, turnstileEnabled } from "../components/Turnstile";
 
@@ -13,6 +12,8 @@ const GUARANTEES = [
   "Unprivileged user with limits: 1 CPU, 128 MB memory, 32 processes, 8 MB disk, 10 s",
   "The folder is deleted afterwards; only file names and sizes are returned",
 ];
+
+const FACTS = ["gVisor kernel", "No network", "1 CPU · 128 MB · 10 s", "Deleted afterwards"];
 
 const STARTER = `# Python 3.12 · standard library only · no network
 import json, hashlib
@@ -25,11 +26,21 @@ with open("/workspace/result.json", "w") as f:
     json.dump(data, f)
 `;
 
-const AGENT_EXAMPLES = [
-  "Build a one-page landing site for a coffee shop called Ember with a hero, a menu and a footer",
-  "Write a function that reverses the words in a sentence, with tests",
-  "Implement a small LRU cache class with tests",
+const AGENT_EXAMPLES: { icon: string; text: string }[] = [
+  { icon: "web", text: "Build a one-page landing site for a coffee shop called Ember with a hero, a menu and a footer" },
+  { icon: "fn", text: "Write a function that reverses the words in a sentence, with tests" },
+  { icon: "cache", text: "Implement a small LRU cache class with tests" },
 ];
+
+function Icon({ name }: { name: string }) {
+  const p = { width: 18, height: 18, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.7, strokeLinecap: "round" as const, strokeLinejoin: "round" as const, "aria-hidden": true };
+  if (name === "web") return <svg {...p}><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M3 9h18" /><path d="M7 6.5h.01M10 6.5h.01" /></svg>;
+  if (name === "fn") return <svg {...p}><path d="m8 7-5 5 5 5" /><path d="m16 7 5 5-5 5" /><path d="m13.5 5-3 14" /></svg>;
+  if (name === "cache") return <svg {...p}><rect x="4" y="4" width="16" height="6" rx="2" /><rect x="4" y="14" width="16" height="6" rx="2" /><path d="M8 7h.01M8 17h.01" /></svg>;
+  if (name === "play") return <svg {...p}><path d="M7 5v14l11-7z" /></svg>;
+  if (name === "file") return <svg {...p}><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" /><path d="M14 3v5h5" /></svg>;
+  return <svg {...p}><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></svg>;
+}
 
 /** Save the agent's files as a zip-free bundle: one download per file is noisy, so
  *  offer the single page when there is one, else the main solution file. */
@@ -50,13 +61,13 @@ function fmtBytes(n: number): string {
 type Mode = "run" | "agent";
 
 export default function WorkspacePage() {
-  const [mode, setMode] = useState<Mode>("run");
+  const [mode, setMode] = useState<Mode>("agent");
   const [run, setRun] = useState<WorkspaceRun | null>(null);
   const [agent, setAgent] = useState<AgentCodeResult | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<"" | "starter" | "python" | "agent">("");
   const [source, setSource] = useState(STARTER);
-  const [task, setTask] = useState(AGENT_EXAMPLES[0]);
+  const [task, setTask] = useState("");
   const [token, setToken] = useState<string | null>(null);
 
   function switchMode(next: Mode) {
@@ -70,8 +81,10 @@ export default function WorkspacePage() {
     setError("");
     try {
       if (kind === "agent") {
+        setRun(null);
         setAgent(await api.runAgentCode(task, token ?? undefined));
       } else {
+        setAgent(null);
         setRun(
           kind === "starter"
             ? await api.runWebStarter()
@@ -91,147 +104,157 @@ export default function WorkspacePage() {
   const sourceBytes = new TextEncoder().encode(source).length;
   const tooBig = sourceBytes > 16 * 1024;
   const needsVerify = turnstileEnabled && !token;
+  const agentReady = task.trim().length > 0;
+  const submit = () => (mode === "agent" ? exec("agent") : exec("python"));
+  const canSubmit =
+    busy === "" && !needsVerify && (mode === "agent" ? agentReady : !tooBig && sourceBytes > 0);
 
   return (
     <>
-      <PageHeader
-        eyebrow="Agent workspace"
-        title="Workspace"
-        subhead="Run code in an isolated, writable, throwaway workspace, or let an agent write and test it for you. The sandbox owns the image, command and limits."
-        right={
-          <button className="btn" onClick={() => exec("starter")} disabled={busy !== ""}>
-            {busy === "starter" ? "Running…" : "Run web starter"}
-          </button>
-        }
-      />
+      <section className="ws-hero">
+        <p className="eyebrow">Agent workspace</p>
+        <h1>What should run in the sandbox?</h1>
+        <p className="ws-sub">
+          Describe a small program and an agent writes it, tests it and fixes it. Or run your own
+          Python. Either way it runs in a throwaway workspace that is deleted afterwards.
+        </p>
 
-      <section className="panel">
-        <header className="panel-head">
-          <div>
-            <p className="eyebrow">Isolation</p>
-            <h2>What a workspace can and cannot do</h2>
+        <div className="ws-composer">
+          {mode === "agent" ? (
+            <textarea
+              aria-label="Task for the code agent"
+              className="ws-input"
+              value={task}
+              onChange={(e) => setTask(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && canSubmit) submit();
+              }}
+              maxLength={600}
+              rows={3}
+              placeholder="Describe a small program, for example a landing page or a function with tests"
+            />
+          ) : (
+            <textarea
+              aria-label="Python source"
+              className="ws-input ws-code"
+              value={source}
+              onChange={(e) => setSource(e.target.value)}
+              spellCheck={false}
+              rows={11}
+            />
+          )}
+
+          <div className="ws-bar">
+            <div role="tablist" aria-label="Workspace mode" className="ws-seg">
+              <button
+                role="tab"
+                aria-selected={mode === "agent"}
+                className={mode === "agent" ? "on" : ""}
+                onClick={() => switchMode("agent")}
+              >
+                Ask the agent
+              </button>
+              <button
+                role="tab"
+                aria-selected={mode === "run"}
+                className={mode === "run" ? "on" : ""}
+                onClick={() => switchMode("run")}
+              >
+                Run my code
+              </button>
+            </div>
+            <span className="ws-count">
+              {mode === "agent"
+                ? `${task.length} / 600`
+                : `${fmtBytes(sourceBytes)} / 16 KB${tooBig ? " · too large" : ""}`}
+            </span>
+            <button
+              className="ws-send"
+              onClick={submit}
+              disabled={!canSubmit}
+              aria-label={mode === "agent" ? "Run agent" : "Run Python"}
+              title={mode === "agent" ? "Run agent" : "Run Python"}
+            >
+              {busy === "agent" || busy === "python" ? <span className="ws-spin" /> : <Icon name="go" />}
+            </button>
           </div>
-        </header>
-        <ul>
-          {GUARANTEES.map((g) => (
-            <li key={g}>{g}</li>
-          ))}
+        </div>
+
+        {turnstileEnabled && (
+          <div className="ws-verify">
+            <Turnstile key={`ts-${mode}`} onToken={setToken} />
+          </div>
+        )}
+
+        {busy === "agent" && (
+          <p className="ws-note" role="status">
+            The agent is working. It writes the code and its tests, runs them, reads the failures
+            and fixes them. This can take a minute.
+          </p>
+        )}
+        {mode === "run" && !turnstileEnabled && (
+          <p className="ws-note">
+            Code runs are switched off on this deployment until human verification is configured.
+          </p>
+        )}
+
+        <ul className="ws-list" aria-label="Suggestions">
+          {mode === "agent" &&
+            AGENT_EXAMPLES.map((ex) => (
+              <li key={ex.text}>
+                <button type="button" onClick={() => setTask(ex.text)}>
+                  <Icon name={ex.icon} />
+                  <span>{ex.text}</span>
+                </button>
+              </li>
+            ))}
+          {mode === "run" && (
+            <li>
+              <button type="button" onClick={() => setSource(STARTER)}>
+                <Icon name="file" />
+                <span>Load the starter script</span>
+              </button>
+            </li>
+          )}
+          <li>
+            <button type="button" onClick={() => exec("starter")} disabled={busy !== ""}>
+              <Icon name="play" />
+              <span>{busy === "starter" ? "Running…" : "Run web starter"}</span>
+              <em>no verification needed</em>
+            </button>
+          </li>
         </ul>
+
+        <div className="ws-facts" aria-label="Isolation">
+          {FACTS.map((f) => (
+            <span key={f}>{f}</span>
+          ))}
+        </div>
+        <details className="ws-details">
+          <summary>What a workspace can and cannot do</summary>
+          <ul>
+            {GUARANTEES.map((g) => (
+              <li key={g}>{g}</li>
+            ))}
+          </ul>
+          {mode === "agent" && (
+            <p>
+              The agent never gets a shell and cannot reach the network. It fixes its own code for up
+              to 4 rounds. Limit: 5 tasks per day. Your code is saved nowhere; the audit log keeps
+              only a hash.
+            </p>
+          )}
+        </details>
       </section>
 
-      <div role="tablist" aria-label="Workspace mode" style={{ display: "flex", gap: 8 }}>
-        <button
-          role="tab"
-          aria-selected={mode === "run"}
-          className={mode === "run" ? "btn primary" : "btn"}
-          onClick={() => switchMode("run")}
-        >
-          Run my code
-        </button>
-        <button
-          role="tab"
-          aria-selected={mode === "agent"}
-          className={mode === "agent" ? "btn primary" : "btn"}
-          onClick={() => switchMode("agent")}
-        >
-          Ask the agent
-        </button>
-      </div>
-
-      {mode === "run" && (
-        <section className="panel">
-          <header className="panel-head">
-            <div>
-              <p className="eyebrow">Python</p>
-              <h2>Run your own code</h2>
-            </div>
-          </header>
-          <textarea
-            aria-label="Python source"
-            value={source}
-            onChange={(e) => setSource(e.target.value)}
-            spellCheck={false}
-            rows={12}
-            style={{ width: "100%", fontFamily: "var(--mono, monospace)", fontSize: 13 }}
-          />
-          <p>
-            {fmtBytes(sourceBytes)} of 16 KB
-            {tooBig ? " — too large" : ""}. Your code is saved nowhere; the audit log keeps only a
-            hash.
-          </p>
-          {turnstileEnabled && <Turnstile key="ts-run" onToken={setToken} />}
-          <button
-            className="btn primary"
-            onClick={() => exec("python")}
-            disabled={busy !== "" || tooBig || sourceBytes === 0 || needsVerify}
-          >
-            {busy === "python" ? "Running…" : "Run Python"}
-          </button>
-          {!turnstileEnabled && (
-            <p>Code runs are switched off on this deployment until human verification is configured.</p>
-          )}
-        </section>
-      )}
-
-      {mode === "agent" && (
-        <section className="panel">
-          <header className="panel-head">
-            <div>
-              <p className="eyebrow">Code agent</p>
-              <h2>Describe a small program</h2>
-            </div>
-          </header>
-          <p>
-            The agent writes Python and its tests, runs them in the workspace above, reads the
-            failures and fixes its own code, up to 4 rounds. It never gets a shell and cannot reach
-            the network. Limit: 5 tasks per day.
-          </p>
-          <textarea
-            aria-label="Task for the code agent"
-            value={task}
-            onChange={(e) => setTask(e.target.value)}
-            maxLength={600}
-            rows={3}
-            style={{ width: "100%" }}
-          />
-          <p>{task.length} of 600 characters. Or start from an example:</p>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-start" }}>
-            {AGENT_EXAMPLES.map((ex) => (
-              <button
-                key={ex}
-                className="btn link"
-                onClick={() => setTask(ex)}
-                type="button"
-                style={{
-                  whiteSpace: "normal",
-                  textAlign: "left",
-                  height: "auto",
-                  maxWidth: "100%",
-                  overflowWrap: "anywhere",
-                }}
-              >
-                {ex}
-              </button>
-            ))}
-          </div>
-          {turnstileEnabled && <Turnstile key="ts-agent" onToken={setToken} />}
-          <button
-            className="btn primary"
-            onClick={() => exec("agent")}
-            disabled={busy !== "" || task.trim().length === 0 || needsVerify}
-          >
-            {busy === "agent" ? "Agent is working… this can take a minute" : "Run agent"}
-          </button>
-        </section>
-      )}
-
+      <div className="ws-results">
       {error && (
         <section className="panel" role="alert">
           <p>{error}</p>
         </section>
       )}
 
-      {mode === "agent" && agent && (
+      {agent && (
         <>
           <section className="metrics">
             <Tile label="Result" value={agent.status.replace("_", " ")} small />
@@ -299,7 +322,7 @@ export default function WorkspacePage() {
         </>
       )}
 
-      {mode === "run" && run && (
+      {run && (
         <>
           <section className="metrics">
             <Tile label="Preset" value={run.preset} small />
@@ -341,6 +364,7 @@ export default function WorkspacePage() {
           </section>
         </>
       )}
+      </div>
     </>
   );
 }

@@ -344,7 +344,7 @@ export function buildServer(deps: { env?: NodeJS.ProcessEnv; fetchImpl?: Fetch; 
   const fetchImpl = deps.fetchImpl ?? fetch;
   const exposePay = deps.exposePay ?? true;
   const ledger: Ledger = { day: today(), spent: 0 };
-  const server = new Server({ name: 'noren', version: '0.1.2' }, { capabilities: { tools: {} } });
+  const server = new Server({ name: 'noren', version: '0.1.4' }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: exposePay ? TOOLS : TOOLS.filter((t) => t.name !== 'noren_pay_call'),
   }));

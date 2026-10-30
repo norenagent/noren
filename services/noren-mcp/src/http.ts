@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { buildServer } from './server.js';
 
@@ -71,4 +73,15 @@ setInterval(() => {
   for (const [k, v] of hits) if (now > v.reset) hits.delete(k);
 }, WINDOW_MS).unref();
 
-http.listen(PORT, HOST, () => console.log(`noren-mcp http listening on ${HOST}:${PORT}`));
+function isEntrypoint(): boolean {
+  // run directly or through npm's .bin symlink; importing this file (tests) must not open a port
+  try {
+    return !!process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+if (isEntrypoint()) {
+  http.listen(PORT, HOST, () => console.log(`noren-mcp http listening on ${HOST}:${PORT}`));
+}
