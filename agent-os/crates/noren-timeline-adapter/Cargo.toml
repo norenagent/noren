@@ -1,0 +1,28 @@
+[package]
+name = "noren-timeline-adapter"
+version = "0.1.0"
+description = "Adapters from Noren records to Noren Timeline v0alpha1 and v0alpha3."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[package.metadata.noren-timeline]
+repository = "https://github.com/norenagent/noren-timeline"
+revision = "88da86d3dce4be33320f93db0ba4f4fc7c0643cf"
+schema = "v0alpha1"
+temporal-package = "@noren-org/timeline"
+temporal-version = "0.0.0-alpha.2"
+temporal-schema = "v0alpha3"
+
+[dependencies]
+noren-audit = { path = "../noren-audit" }
+noren-ipc = { path = "../noren-ipc" }
+serde = { workspace = true }
+serde_jcs = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+noren-types = { path = "../noren-types" }
+uuid = { workspace = true }

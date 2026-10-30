@@ -1,0 +1,9 @@
+#!/bin/sh
+# Noren python-run preset: runs the user's /workspace/main.py with python3.
+# No network, unprivileged user, read-only root; limits are enforced by the
+# runner (cpu, memory, pids, disk, wall-clock) and gVisor.
+set -u
+cd /workspace
+ulimit -f 4096 2>/dev/null   # max single file ~2 MiB (512-byte blocks)
+ulimit -c 0 2>/dev/null      # no core dumps
+exec python3 -E -s -B -S /workspace/main.py

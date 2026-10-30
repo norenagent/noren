@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use Noren in research, please cite the whitepaper below."
+type: software
+title: "Noren: A Capability-Based Operating Layer for Autonomous Software Engineering Agents"
+authors:
+  - family-names: Wasque
+    given-names: Achille
+    url: https://usenoren.xyz/contact
+    affiliation: "The Noren Project"
+repository-code: "https://github.com/norenagent/noren"
+url: "https://usenoren.xyz"
+license: Apache-2.0
+preferred-citation:
+  type: article
+  title: "Noren: A Capability-Based Operating Layer for Autonomous Software Engineering Agents"
+  authors:
+    - family-names: Wasque
+      given-names: Achille
+      affiliation: "The Noren Project"
+  year: 2026
+  month: 5
+  doi: "10.5281/zenodo.20134416"
+  url: "https://doi.org/10.5281/zenodo.20134416"
+  publisher:
+    name: Zenodo

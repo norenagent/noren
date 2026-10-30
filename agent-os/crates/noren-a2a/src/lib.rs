@@ -1,0 +1,6993 @@
+//! Agent-to-agent task and result envelopes for Noren.
+//!
+//! Defines the [`A2ATask`] and [`A2ATaskResult`] wire types and an async
+//! [`Mailbox`] trait. Ships two backends: [`InMemoryMailbox`] for tests
+//! and single-process orchestration, and [`JsonlMailbox`] for the durable
+//! JSONL-backed path the production daemon uses. Both backends share a
+//! leased task queue ([`A2ATaskQueueState`], [`A2ATaskQueueEntry`]), a
+//! receiver-side idempotency cache ([`A2AIdempotency`],
+//! [`A2AIdempotencyCacheKey`], [`A2AIdempotencyCachedResult`]), an
+//! operator-facing repair surface ([`A2ARepairCommand`],
+//! [`A2ARepairRequest`], [`A2ARepairAction`], [`A2ARepairState`],
+//! [`A2ARepairOutcome`]), and an opt-in [`A2AAutoRetryPolicy`] with
+//! [`A2AAutoRetryDecision`] and [`A2AAutoRetryReport`].
+//!
+//! [`A2ATask`] is a request from one agent to another; [`A2ATaskResult`]
+//! is the response. Tasks form a tree via [`A2ATask::parent`] so an
+//! orchestrator can fan a root intent across child agents and
+//! reconstruct the result graph.
+
+#![deny(unsafe_code)]
+
+use async_trait::async_trait;
+use noren_mcp::Content;
+use noren_types::AgentId;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+// parking_lot::Mutex over std::sync::Mutex: no poison concept means a
+// panic inside one Mailbox call cannot lock every subsequent caller out
+// via PoisonError. The .lock() pattern that used to ride on
+// each access is no longer needed — parking_lot's lock() returns the
+// guard directly. Also a measurable perf win on contended paths.
+use parking_lot::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::fs::{self, OpenOptions};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
+use uuid::Uuid;
+
+mod signed;
+pub use signed::{A2AEnvelopeError, SignedA2ATask};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A2ATaskStatus {
+    Ok,
+    Error,
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A2ADuplicateSafety {
+    Unsafe,
+    Idempotent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2AIdempotency {
+    pub duplicate_safety: A2ADuplicateSafety,
+    pub key: String,
+}
+
+impl A2AIdempotency {
+    pub fn new(duplicate_safety: A2ADuplicateSafety, key: impl Into<String>) -> Self {
+        Self {
+            duplicate_safety,
+            key: key.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2AIdempotencyCacheKey {
+    pub sender_pubkey_b58: String,
+    pub recipient_pubkey_b58: String,
+    pub task_kind: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct A2AIdempotencyCachedResult {
+    pub source_task_id: Uuid,
+    pub status: A2ATaskStatus,
+    #[serde(default)]
+    pub content: Vec<Content>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+impl A2AIdempotencyCachedResult {
+    fn from_result(result: &A2ATaskResult) -> Self {
+        Self {
+            source_task_id: result.task_id,
+            status: result.status.clone(),
+            content: result.content.clone(),
+            error_message: result.error_message.clone(),
+        }
+    }
+
+    fn to_result(&self, task_id: Uuid) -> A2ATaskResult {
+        A2ATaskResult {
+            task_id,
+            status: self.status.clone(),
+            content: self.content.clone(),
+            error_message: self.error_message.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2ATask {
+    pub id: Uuid,
+    pub sender: AgentId,
+    pub recipient: AgentId,
+    pub intent_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<A2AIdempotency>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A2ATaskQueueState {
+    Queued,
+    InFlight,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2ATaskQueueEntry {
+    pub state: A2ATaskQueueState,
+    pub task: A2ATask,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leased_to: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leased_at_ms: Option<u64>,
+    #[serde(default)]
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A2ADuplicateRisk {
+    Idempotent,
+    OperatorAccepted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum A2ARepairCommand {
+    Requeue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_id: Option<Uuid>,
+        duplicate_risk: A2ADuplicateRisk,
+    },
+    ForceError {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_id: Option<Uuid>,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2ARepairRequest {
+    pub task_id: Uuid,
+    pub command: A2ARepairCommand,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A2ARepairAction {
+    Requeued,
+    ForcedError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A2ARepairState {
+    Queued,
+    ResultPending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct A2ARepairOutcome {
+    pub task_id: Uuid,
+    pub action: A2ARepairAction,
+    pub state: A2ARepairState,
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<A2ATaskResult>,
+}
+
+fn default_auto_retry_min_lease_age_ms() -> u64 {
+    300_000
+}
+
+fn default_auto_retry_max_attempts() -> u32 {
+    3
+}
+
+fn default_auto_retry_max_requeues() -> usize {
+    1
+}
+
+fn default_auto_retry_scan_limit() -> usize {
+    100
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2AAutoRetryPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_auto_retry_min_lease_age_ms")]
+    pub min_lease_age_ms: u64,
+    #[serde(default = "default_auto_retry_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_auto_retry_max_requeues")]
+    pub max_requeues: usize,
+    #[serde(default = "default_auto_retry_scan_limit")]
+    pub scan_limit: usize,
+}
+
+impl Default for A2AAutoRetryPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_lease_age_ms: default_auto_retry_min_lease_age_ms(),
+            max_attempts: default_auto_retry_max_attempts(),
+            max_requeues: default_auto_retry_max_requeues(),
+            scan_limit: default_auto_retry_scan_limit(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A2AAutoRetrySkipReason {
+    Disabled,
+    NotInFlight,
+    MissingLease,
+    LeaseTooYoung,
+    MissingIdempotency,
+    UnsafeDuplicateSafety,
+    MaxAttemptsReached,
+    LimitReached,
+    CapabilityScopeMismatch,
+}
+
+impl A2AAutoRetrySkipReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NotInFlight => "not_in_flight",
+            Self::MissingLease => "missing_lease",
+            Self::LeaseTooYoung => "lease_too_young",
+            Self::MissingIdempotency => "missing_idempotency",
+            Self::UnsafeDuplicateSafety => "unsafe_duplicate_safety",
+            Self::MaxAttemptsReached => "max_attempts_reached",
+            Self::LimitReached => "limit_reached",
+            Self::CapabilityScopeMismatch => "capability_scope_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2AAutoRetrySkipped {
+    pub task_id: Uuid,
+    pub reason: A2AAutoRetrySkipReason,
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2AAutoRetryRequeued {
+    pub task_id: Uuid,
+    pub lease_id: Uuid,
+    pub attempt: u32,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2AAutoRetryReport {
+    pub policy: A2AAutoRetryPolicy,
+    pub considered: usize,
+    #[serde(default)]
+    pub requeued: Vec<A2AAutoRetryRequeued>,
+    #[serde(default)]
+    pub skipped: Vec<A2AAutoRetrySkipped>,
+}
+
+impl A2AAutoRetryReport {
+    pub fn new(policy: A2AAutoRetryPolicy) -> Self {
+        Self {
+            policy,
+            considered: 0,
+            requeued: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum A2AAutoRetryDecision {
+    Requeue {
+        lease_id: Uuid,
+        lease_age_ms: u64,
+        idempotency_key: String,
+    },
+    Skip {
+        reason: A2AAutoRetrySkipReason,
+        lease_age_ms: Option<u64>,
+    },
+}
+
+pub fn evaluate_auto_retry(
+    entry: &A2ATaskQueueEntry,
+    policy: &A2AAutoRetryPolicy,
+    now_ms: u64,
+) -> A2AAutoRetryDecision {
+    if !policy.enabled {
+        return A2AAutoRetryDecision::Skip {
+            reason: A2AAutoRetrySkipReason::Disabled,
+            lease_age_ms: None,
+        };
+    }
+
+    if entry.state != A2ATaskQueueState::InFlight {
+        return A2AAutoRetryDecision::Skip {
+            reason: A2AAutoRetrySkipReason::NotInFlight,
+            lease_age_ms: None,
+        };
+    }
+
+    let (Some(lease_id), Some(leased_at_ms)) = (entry.lease_id, entry.leased_at_ms) else {
+        return A2AAutoRetryDecision::Skip {
+            reason: A2AAutoRetrySkipReason::MissingLease,
+            lease_age_ms: None,
+        };
+    };
+    let lease_age_ms = now_ms.saturating_sub(leased_at_ms);
+    if lease_age_ms < policy.min_lease_age_ms {
+        return A2AAutoRetryDecision::Skip {
+            reason: A2AAutoRetrySkipReason::LeaseTooYoung,
+            lease_age_ms: Some(lease_age_ms),
+        };
+    }
+
+    let Some(idempotency) = &entry.task.idempotency else {
+        return A2AAutoRetryDecision::Skip {
+            reason: A2AAutoRetrySkipReason::MissingIdempotency,
+            lease_age_ms: Some(lease_age_ms),
+        };
+    };
+    if idempotency.key.trim().is_empty() {
+        return A2AAutoRetryDecision::Skip {
+            reason: A2AAutoRetrySkipReason::MissingIdempotency,
+            lease_age_ms: Some(lease_age_ms),
+        };
+    }
+    if idempotency.duplicate_safety != A2ADuplicateSafety::Idempotent {
+        return A2AAutoRetryDecision::Skip {
+            reason: A2AAutoRetrySkipReason::UnsafeDuplicateSafety,
+            lease_age_ms: Some(lease_age_ms),
+        };
+    }
+    if entry.attempt >= policy.max_attempts {
+        return A2AAutoRetryDecision::Skip {
+            reason: A2AAutoRetrySkipReason::MaxAttemptsReached,
+            lease_age_ms: Some(lease_age_ms),
+        };
+    }
+
+    A2AAutoRetryDecision::Requeue {
+        lease_id,
+        lease_age_ms,
+        idempotency_key: idempotency.key.clone(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct A2ATaskResult {
+    pub task_id: Uuid,
+    pub status: A2ATaskStatus,
+    #[serde(default)]
+    pub content: Vec<Content>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+impl A2ATaskResult {
+    pub fn ok(task_id: Uuid, content: Vec<Content>) -> Self {
+        Self {
+            task_id,
+            status: A2ATaskStatus::Ok,
+            content,
+            error_message: None,
+        }
+    }
+
+    pub fn error(task_id: Uuid, message: impl Into<String>) -> Self {
+        Self {
+            task_id,
+            status: A2ATaskStatus::Error,
+            content: Vec::new(),
+            error_message: Some(message.into()),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum A2AError {
+    #[error("mailbox closed")]
+    Closed,
+    #[error("serde: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("task {0} is not currently leased")]
+    TaskNotInFlight(Uuid),
+    #[error("lease mismatch for task {task_id}: expected {expected:?}, actual {actual:?}")]
+    LeaseMismatch {
+        task_id: Uuid,
+        expected: Option<Uuid>,
+        actual: Option<Uuid>,
+    },
+    #[error("invalid task: {0}")]
+    InvalidTask(String),
+    #[error("invalid repair request: {0}")]
+    InvalidRepair(String),
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn validate_repair_request(request: &A2ARepairRequest) -> Result<(), A2AError> {
+    if request.reason.trim().is_empty() {
+        return Err(A2AError::InvalidRepair("reason must not be empty".into()));
+    }
+    if let A2ARepairCommand::ForceError { message, .. } = &request.command {
+        if message.trim().is_empty() {
+            return Err(A2AError::InvalidRepair(
+                "force_error message must not be empty".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_task(task: &A2ATask) -> Result<(), A2AError> {
+    if task.intent_text.trim().is_empty() {
+        return Err(A2AError::InvalidTask(
+            "intent_text must not be empty".into(),
+        ));
+    }
+    if task
+        .task_kind
+        .as_deref()
+        .is_some_and(|kind| kind.trim().is_empty())
+    {
+        return Err(A2AError::InvalidTask(
+            "task_kind must not be empty when present".into(),
+        ));
+    }
+    if let Some(idempotency) = &task.idempotency {
+        if idempotency.key.trim().is_empty() {
+            return Err(A2AError::InvalidTask(
+                "idempotency key must not be empty".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn idempotency_cache_key(task: &A2ATask) -> Option<A2AIdempotencyCacheKey> {
+    let idempotency = task.idempotency.as_ref()?;
+    if idempotency.duplicate_safety != A2ADuplicateSafety::Idempotent {
+        return None;
+    }
+    let key = idempotency.key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some(A2AIdempotencyCacheKey {
+        sender_pubkey_b58: task.sender.pubkey_base58(),
+        recipient_pubkey_b58: task.recipient.pubkey_base58(),
+        task_kind: task
+            .task_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or(&task.intent_text)
+            .to_owned(),
+        key: key.to_owned(),
+    })
+}
+
+fn assert_lease_match(
+    task_id: Uuid,
+    expected: Option<Uuid>,
+    actual: Option<Uuid>,
+) -> Result<(), A2AError> {
+    if expected.is_some() && expected != actual {
+        return Err(A2AError::LeaseMismatch {
+            task_id,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Per-agent inbox. Tasks land in `recv_task`; results for tasks the agent
+/// itself dispatched land in `recv_result`. Both `recv_*` are async and
+/// resolve when something is available; impl is responsible for fairness.
+#[async_trait]
+pub trait Mailbox: Send + Sync {
+    async fn send_task(&self, task: A2ATask) -> Result<(), A2AError>;
+    async fn recv_task(&self) -> Result<A2ATask, A2AError>;
+    /// Non-blocking, peer-scoped recv for the RPC-style daemon transports.
+    /// Returns the oldest queued task whose `recipient` equals `recipient`,
+    /// or `None` if no matching task is queued. Mailbox state is shared
+    /// across peers, but each peer only observes — and only consumes —
+    /// tasks addressed to it.
+    async fn try_recv_task_for(&self, recipient: &AgentId) -> Result<Option<A2ATask>, A2AError>;
+    async fn send_result(&self, result: A2ATaskResult) -> Result<(), A2AError>;
+    async fn recv_result(&self) -> Result<A2ATaskResult, A2AError>;
+    /// Non-blocking, peer-scoped result recv. Returns the oldest queued
+    /// result whose underlying task's `sender` equals `peer` — i.e., the
+    /// peer that originally dispatched the task is the one that can drain
+    /// its response. Look up uses the senders map maintained by
+    /// `send_task`; results whose `task_id` is unknown to the senders map
+    /// are skipped (never returned to any peer).
+    async fn try_recv_result_for(&self, peer: &AgentId) -> Result<Option<A2ATaskResult>, A2AError>;
+
+    /// Read-only snapshot of the most recent queued tasks, oldest first up
+    /// to `limit`. Does not consume from the queue. Operator-facing.
+    async fn recent_tasks(&self, limit: usize) -> Result<Vec<A2ATask>, A2AError>;
+    /// Read-only snapshot of queued and leased tasks. A leased task has
+    /// been delivered to a recipient but has not produced a result yet.
+    /// Leases survive daemon restart and are not automatically redelivered.
+    async fn task_queue(&self, limit: usize) -> Result<Vec<A2ATaskQueueEntry>, A2AError>;
+    /// Operator-controlled repair path for an in-flight lease. Repair
+    /// commands never run automatically; callers must provide a reason
+    /// and, for requeue, an explicit duplicate-work risk posture.
+    async fn repair_task(&self, request: A2ARepairRequest) -> Result<A2ARepairOutcome, A2AError>;
+    /// Read-only snapshot of the most recent queued results, oldest first
+    /// up to `limit`. Does not consume from the queue. Operator-facing.
+    async fn recent_results(&self, limit: usize) -> Result<Vec<A2ATaskResult>, A2AError>;
+
+    /// Look up the original sender for a task that was previously
+    /// dispatched through [`Mailbox::send_task`]. Returns `None` for any
+    /// `task_id` the mailbox has never seen. Used by the daemon to gate
+    /// `PostA2AResult` on the sender-scoped `a2a.respond.<sender>`
+    /// capability.
+    async fn lookup_task_sender(&self, task_id: Uuid) -> Result<Option<AgentId>, A2AError>;
+
+    /// Drop dead state from the underlying event log so the on-disk
+    /// representation stays bounded over a long-running daemon. Returns
+    /// the number of log events removed (zero if nothing was eligible
+    /// or the implementation has no on-disk log).
+    ///
+    /// "Dead state" is operator-driven and conservatively defined: a
+    /// `task_id` is droppable iff (a) it has been received (`TaskRecv`
+    /// in the log) AND (b) at least one result has been posted for it
+    /// AND (c) every posted result has a matching `ResultRecv`. Any
+    /// task still queued, drained-but-no-result-yet, or with results
+    /// that have not been drained stays in the log. Fire-and-forget
+    /// tasks (no result ever posted) are never droppable in v0 — a
+    /// future timestamp-aware compaction mode would close that gap.
+    async fn compact(&self) -> Result<u64, A2AError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskLease {
+    lease_id: Uuid,
+    task: A2ATask,
+    leased_to: AgentId,
+    leased_at_ms: u64,
+    attempt: u32,
+}
+
+impl A2ATaskQueueEntry {
+    fn queued(task: A2ATask) -> Self {
+        Self {
+            state: A2ATaskQueueState::Queued,
+            task,
+            lease_id: None,
+            leased_to: None,
+            leased_at_ms: None,
+            attempt: 0,
+        }
+    }
+
+    fn in_flight(lease: TaskLease) -> Self {
+        Self {
+            state: A2ATaskQueueState::InFlight,
+            task: lease.task,
+            lease_id: Some(lease.lease_id),
+            leased_to: Some(lease.leased_to),
+            leased_at_ms: Some(lease.leased_at_ms),
+            attempt: lease.attempt,
+        }
+    }
+}
+
+/// In-process FIFO mailbox. Useful for tests and for orchestrator agents
+/// that fan tasks within the same daemon.
+pub struct InMemoryMailbox {
+    tasks: Mutex<VecDeque<A2ATask>>,
+    results: Mutex<VecDeque<A2ATaskResult>>,
+    in_flight: Mutex<HashMap<Uuid, TaskLease>>,
+    attempts: Mutex<HashMap<Uuid, u32>>,
+    /// Permanent record of who sent each task, populated on
+    /// [`Mailbox::send_task`] and never pruned. The daemon uses this map
+    /// to attribute `PostA2AResult` calls back to the original sender so
+    /// the capability check can use the sender-scoped action.
+    senders: Mutex<HashMap<Uuid, AgentId>>,
+    result_cache: Mutex<HashMap<A2AIdempotencyCacheKey, A2AIdempotencyCachedResult>>,
+    task_notify: Notify,
+    result_notify: Notify,
+}
+
+impl Default for InMemoryMailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InMemoryMailbox {
+    pub fn new() -> Self {
+        Self {
+            tasks: Mutex::new(VecDeque::new()),
+            results: Mutex::new(VecDeque::new()),
+            in_flight: Mutex::new(HashMap::new()),
+            attempts: Mutex::new(HashMap::new()),
+            senders: Mutex::new(HashMap::new()),
+            result_cache: Mutex::new(HashMap::new()),
+            task_notify: Notify::new(),
+            result_notify: Notify::new(),
+        }
+    }
+
+    fn lease_task(&self, task: A2ATask, leased_to: AgentId) -> A2ATask {
+        let attempt = {
+            let mut attempts = self.attempts.lock();
+            let attempt = attempts
+                .get(&task.id)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            attempts.insert(task.id, attempt);
+            attempt
+        };
+        let lease = TaskLease {
+            lease_id: Uuid::new_v4(),
+            task: task.clone(),
+            leased_to,
+            leased_at_ms: epoch_ms(),
+            attempt,
+        };
+        self.in_flight.lock().insert(task.id, lease);
+        task
+    }
+
+    fn queued_entry(&self, task: A2ATask) -> A2ATaskQueueEntry {
+        let attempt = self.attempts.lock().get(&task.id).copied().unwrap_or(0);
+        A2ATaskQueueEntry {
+            attempt,
+            ..A2ATaskQueueEntry::queued(task)
+        }
+    }
+}
+
+#[async_trait]
+impl Mailbox for InMemoryMailbox {
+    async fn send_task(&self, task: A2ATask) -> Result<(), A2AError> {
+        validate_task(&task)?;
+        if let Some(cached) =
+            idempotency_cache_key(&task).and_then(|key| self.result_cache.lock().get(&key).cloned())
+        {
+            let result = cached.to_result(task.id);
+            self.senders.lock().insert(task.id, task.sender.clone());
+            self.attempts.lock().entry(task.id).or_insert(0);
+            self.results.lock().push_back(result);
+            self.result_notify.notify_one();
+            return Ok(());
+        }
+        self.senders.lock().insert(task.id, task.sender.clone());
+        self.attempts.lock().entry(task.id).or_insert(0);
+        self.tasks.lock().push_back(task);
+        self.task_notify.notify_one();
+        Ok(())
+    }
+
+    async fn recv_task(&self) -> Result<A2ATask, A2AError> {
+        loop {
+            if let Some(t) = self.tasks.lock().pop_front() {
+                return Ok(self.lease_task(t.clone(), t.recipient.clone()));
+            }
+            self.task_notify.notified().await;
+        }
+    }
+
+    async fn try_recv_task_for(&self, recipient: &AgentId) -> Result<Option<A2ATask>, A2AError> {
+        let mut tasks = self.tasks.lock();
+        let Some(pos) = tasks.iter().position(|t| t.recipient == *recipient) else {
+            return Ok(None);
+        };
+        let task = tasks.remove(pos);
+        drop(tasks);
+        Ok(task.map(|t| self.lease_task(t, recipient.clone())))
+    }
+
+    async fn send_result(&self, result: A2ATaskResult) -> Result<(), A2AError> {
+        let completed = self.in_flight.lock().remove(&result.task_id);
+        if let Some(lease) = completed {
+            if let Some(key) = idempotency_cache_key(&lease.task) {
+                self.result_cache
+                    .lock()
+                    .insert(key, A2AIdempotencyCachedResult::from_result(&result));
+            }
+        }
+        self.results.lock().push_back(result);
+        self.result_notify.notify_one();
+        Ok(())
+    }
+
+    async fn recv_result(&self) -> Result<A2ATaskResult, A2AError> {
+        loop {
+            if let Some(r) = self.results.lock().pop_front() {
+                return Ok(r);
+            }
+            self.result_notify.notified().await;
+        }
+    }
+
+    async fn try_recv_result_for(&self, peer: &AgentId) -> Result<Option<A2ATaskResult>, A2AError> {
+        let senders = self.senders.lock();
+        let mut results = self.results.lock();
+        let pos = results
+            .iter()
+            .position(|r| senders.get(&r.task_id).map(|s| s == peer).unwrap_or(false));
+        Ok(pos.and_then(|p| results.remove(p)))
+    }
+
+    async fn recent_tasks(&self, limit: usize) -> Result<Vec<A2ATask>, A2AError> {
+        Ok(self.tasks.lock().iter().take(limit).cloned().collect())
+    }
+
+    async fn task_queue(&self, limit: usize) -> Result<Vec<A2ATaskQueueEntry>, A2AError> {
+        let mut entries: Vec<A2ATaskQueueEntry> = self
+            .tasks
+            .lock()
+            .iter()
+            .cloned()
+            .map(|task| self.queued_entry(task))
+            .collect();
+        let mut leased: Vec<A2ATaskQueueEntry> = self
+            .in_flight
+            .lock()
+            .values()
+            .cloned()
+            .map(A2ATaskQueueEntry::in_flight)
+            .collect();
+        leased.sort_by(|a, b| {
+            a.leased_at_ms
+                .cmp(&b.leased_at_ms)
+                .then_with(|| a.task.id.cmp(&b.task.id))
+        });
+        entries.extend(leased);
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
+    async fn repair_task(&self, request: A2ARepairRequest) -> Result<A2ARepairOutcome, A2AError> {
+        validate_repair_request(&request)?;
+
+        match request.command {
+            A2ARepairCommand::Requeue { lease_id, .. } => {
+                let lease = {
+                    let mut in_flight = self.in_flight.lock();
+                    let lease = in_flight
+                        .get(&request.task_id)
+                        .cloned()
+                        .ok_or(A2AError::TaskNotInFlight(request.task_id))?;
+                    assert_lease_match(request.task_id, lease_id, Some(lease.lease_id))?;
+                    in_flight.remove(&request.task_id);
+                    lease
+                };
+                self.tasks.lock().push_back(lease.task);
+                self.task_notify.notify_one();
+                Ok(A2ARepairOutcome {
+                    task_id: request.task_id,
+                    action: A2ARepairAction::Requeued,
+                    state: A2ARepairState::Queued,
+                    attempt: lease.attempt,
+                    result: None,
+                })
+            }
+            A2ARepairCommand::ForceError { lease_id, message } => {
+                let lease = {
+                    let mut in_flight = self.in_flight.lock();
+                    let lease = in_flight
+                        .get(&request.task_id)
+                        .cloned()
+                        .ok_or(A2AError::TaskNotInFlight(request.task_id))?;
+                    assert_lease_match(request.task_id, lease_id, Some(lease.lease_id))?;
+                    in_flight.remove(&request.task_id);
+                    lease
+                };
+                let result = A2ATaskResult::error(request.task_id, message);
+                self.results.lock().push_back(result.clone());
+                self.result_notify.notify_one();
+                Ok(A2ARepairOutcome {
+                    task_id: request.task_id,
+                    action: A2ARepairAction::ForcedError,
+                    state: A2ARepairState::ResultPending,
+                    attempt: lease.attempt,
+                    result: Some(result),
+                })
+            }
+        }
+    }
+
+    async fn recent_results(&self, limit: usize) -> Result<Vec<A2ATaskResult>, A2AError> {
+        Ok(self.results.lock().iter().take(limit).cloned().collect())
+    }
+
+    async fn lookup_task_sender(&self, task_id: Uuid) -> Result<Option<AgentId>, A2AError> {
+        Ok(self.senders.lock().get(&task_id).cloned())
+    }
+
+    async fn compact(&self) -> Result<u64, A2AError> {
+        // Hold every relevant lock for the whole call so a concurrent
+        // send/recv cannot reach a state where a task ID is briefly
+        // absent from in_flight before its result lands in results,
+        // which would let the drop step strand an orphan result.
+        // Lock order: senders → attempts → in_flight → tasks →
+        // results → result_cache. senders-first matches
+        // try_recv_result_for, the only other multi-lock holder.
+        let mut senders = self.senders.lock();
+        let mut attempts = self.attempts.lock();
+        let in_flight = self.in_flight.lock();
+        let tasks = self.tasks.lock();
+        let results = self.results.lock();
+        let mut result_cache = self.result_cache.lock();
+
+        let pending_tasks: HashSet<Uuid> = tasks.iter().map(|t| t.id).collect();
+        let in_flight_ids: HashSet<Uuid> = in_flight.keys().copied().collect();
+        let pending_results: HashSet<Uuid> = results.iter().map(|r| r.task_id).collect();
+
+        let droppable: HashSet<Uuid> = senders
+            .keys()
+            .copied()
+            .filter(|id| {
+                !pending_tasks.contains(id)
+                    && !in_flight_ids.contains(id)
+                    && !pending_results.contains(id)
+            })
+            .collect();
+
+        if droppable.is_empty() {
+            return Ok(0);
+        }
+
+        let mut dropped = 0u64;
+        for tid in &droppable {
+            if senders.remove(tid).is_some() {
+                dropped += 1;
+            }
+            attempts.remove(tid);
+        }
+        result_cache.retain(|_, v| !droppable.contains(&v.source_task_id));
+        Ok(dropped)
+    }
+}
+
+/// Append-only event log of mailbox state transitions, written one
+/// JSON line at a time. [`JsonlMailbox::open`] replays the log to
+/// rebuild in-memory state, so a daemon restart does not drop queued
+/// tasks, queued results, or the senders map used by the
+/// `a2a.respond.<sender>` capability check.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MailboxEvent {
+    TaskSent {
+        task: A2ATask,
+    },
+    TaskRecv {
+        task_id: Uuid,
+    },
+    TaskLeased {
+        task_id: Uuid,
+        lease_id: Uuid,
+        leased_to: AgentId,
+        leased_at_ms: u64,
+        attempt: u32,
+    },
+    TaskRequeued {
+        task_id: Uuid,
+        lease_id: Uuid,
+        reason: String,
+        duplicate_risk: A2ADuplicateRisk,
+        requeued_at_ms: u64,
+        attempt: u32,
+    },
+    TaskForceErrored {
+        task_id: Uuid,
+        lease_id: Uuid,
+        result: A2ATaskResult,
+        reason: String,
+        forced_at_ms: u64,
+        attempt: u32,
+    },
+    IdempotencyResultCached {
+        cache_key: A2AIdempotencyCacheKey,
+        result: A2AIdempotencyCachedResult,
+    },
+    IdempotencyResultReplayed {
+        task: A2ATask,
+        result: A2ATaskResult,
+    },
+    ResultPosted {
+        result: A2ATaskResult,
+    },
+    ResultRecv {
+        task_id: Uuid,
+    },
+}
+
+struct MailboxState {
+    tasks: VecDeque<A2ATask>,
+    results: VecDeque<A2ATaskResult>,
+    in_flight: HashMap<Uuid, TaskLease>,
+    senders: HashMap<Uuid, AgentId>,
+    attempts: HashMap<Uuid, u32>,
+    result_cache: HashMap<A2AIdempotencyCacheKey, A2AIdempotencyCachedResult>,
+}
+
+impl MailboxState {
+    fn empty() -> Self {
+        Self {
+            tasks: VecDeque::new(),
+            results: VecDeque::new(),
+            in_flight: HashMap::new(),
+            senders: HashMap::new(),
+            attempts: HashMap::new(),
+            result_cache: HashMap::new(),
+        }
+    }
+
+    fn apply(&mut self, ev: MailboxEvent) {
+        match ev {
+            MailboxEvent::TaskSent { task } => {
+                self.senders.insert(task.id, task.sender.clone());
+                self.attempts.entry(task.id).or_insert(0);
+                self.tasks.push_back(task);
+            }
+            MailboxEvent::TaskRecv { task_id } => {
+                self.lease_task(task_id, Uuid::nil(), None, 0, self.next_attempt(task_id));
+            }
+            MailboxEvent::TaskLeased {
+                task_id,
+                lease_id,
+                leased_to,
+                leased_at_ms,
+                attempt,
+            } => {
+                self.lease_task(task_id, lease_id, Some(leased_to), leased_at_ms, attempt);
+            }
+            MailboxEvent::TaskRequeued {
+                task_id, attempt, ..
+            } => {
+                self.requeue_task(task_id, attempt);
+            }
+            MailboxEvent::TaskForceErrored {
+                task_id,
+                result,
+                attempt,
+                ..
+            } => {
+                self.in_flight.remove(&task_id);
+                self.attempts.insert(task_id, attempt);
+                self.results.push_back(result);
+            }
+            MailboxEvent::IdempotencyResultCached { cache_key, result } => {
+                self.result_cache.insert(cache_key, result);
+            }
+            MailboxEvent::IdempotencyResultReplayed { task, result } => {
+                self.senders.insert(task.id, task.sender.clone());
+                self.attempts.entry(task.id).or_insert(0);
+                self.results.push_back(result);
+            }
+            MailboxEvent::ResultPosted { result } => {
+                self.in_flight.remove(&result.task_id);
+                self.results.push_back(result);
+            }
+            MailboxEvent::ResultRecv { task_id } => {
+                if let Some(pos) = self.results.iter().position(|r| r.task_id == task_id) {
+                    self.results.remove(pos);
+                }
+            }
+        }
+    }
+
+    fn next_attempt(&self, task_id: Uuid) -> u32 {
+        self.attempts
+            .get(&task_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    fn lease_task(
+        &mut self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        leased_to: Option<AgentId>,
+        leased_at_ms: u64,
+        attempt: u32,
+    ) -> Option<A2ATask> {
+        let pos = self.tasks.iter().position(|t| t.id == task_id)?;
+        let task = self.tasks.remove(pos)?;
+        let lease = TaskLease {
+            lease_id,
+            leased_to: leased_to.unwrap_or_else(|| task.recipient.clone()),
+            leased_at_ms,
+            attempt,
+            task: task.clone(),
+        };
+        self.in_flight.insert(task_id, lease);
+        self.attempts.insert(task_id, attempt);
+        Some(task)
+    }
+
+    fn requeue_task(&mut self, task_id: Uuid, attempt: u32) -> Option<A2ATask> {
+        let lease = self.in_flight.remove(&task_id)?;
+        self.attempts.insert(task_id, attempt);
+        let task = lease.task;
+        self.tasks.push_back(task.clone());
+        Some(task)
+    }
+
+    fn task_queue(&self, limit: usize) -> Vec<A2ATaskQueueEntry> {
+        let mut entries: Vec<A2ATaskQueueEntry> = self
+            .tasks
+            .iter()
+            .cloned()
+            .map(|task| {
+                let attempt = self.attempts.get(&task.id).copied().unwrap_or(0);
+                A2ATaskQueueEntry {
+                    attempt,
+                    ..A2ATaskQueueEntry::queued(task)
+                }
+            })
+            .collect();
+        let mut leased: Vec<A2ATaskQueueEntry> = self
+            .in_flight
+            .values()
+            .cloned()
+            .map(A2ATaskQueueEntry::in_flight)
+            .collect();
+        leased.sort_by(|a, b| {
+            a.leased_at_ms
+                .cmp(&b.leased_at_ms)
+                .then_with(|| a.task.id.cmp(&b.task.id))
+        });
+        entries.extend(leased);
+        entries.truncate(limit);
+        entries
+    }
+}
+
+/// JSONL-backed [`Mailbox`]. Restart-resilient sibling of
+/// [`InMemoryMailbox`]: every state transition is appended to a log
+/// file before the in-memory state is mutated, so a crash between the
+/// write and the mutation can only leave the on-disk log slightly
+/// ahead of what was observed by callers — never behind.
+pub struct JsonlMailbox {
+    path: PathBuf,
+    state: Mutex<MailboxState>,
+    file_lock: AsyncMutex<()>,
+    task_notify: Notify,
+    result_notify: Notify,
+}
+
+impl JsonlMailbox {
+    pub async fn open(path: PathBuf) -> Result<Self, A2AError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+
+        let mut state = MailboxState::empty();
+        let f = fs::File::open(&path).await?;
+        let mut reader = BufReader::new(f);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let ev: MailboxEvent = serde_json::from_str(trimmed)?;
+            state.apply(ev);
+        }
+
+        Ok(Self {
+            path,
+            state: Mutex::new(state),
+            file_lock: AsyncMutex::new(()),
+            task_notify: Notify::new(),
+            result_notify: Notify::new(),
+        })
+    }
+
+    async fn append(&self, ev: &MailboxEvent) -> Result<(), A2AError> {
+        let line = serde_json::to_string(ev)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await?;
+        f.write_all(line.as_bytes()).await?;
+        f.write_all(b"\n").await?;
+        f.flush().await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Mailbox for JsonlMailbox {
+    async fn send_task(&self, task: A2ATask) -> Result<(), A2AError> {
+        validate_task(&task)?;
+        let _g = self.file_lock.lock().await;
+        let replay = {
+            let s = self.state.lock();
+            idempotency_cache_key(&task)
+                .and_then(|key| s.result_cache.get(&key).cloned())
+                .map(|cached| cached.to_result(task.id))
+        };
+        if let Some(result) = replay {
+            let event = MailboxEvent::IdempotencyResultReplayed {
+                task: task.clone(),
+                result,
+            };
+            self.append(&event).await?;
+            self.state.lock().apply(event);
+            self.result_notify.notify_one();
+            return Ok(());
+        }
+        self.append(&MailboxEvent::TaskSent { task: task.clone() })
+            .await?;
+        {
+            let mut s = self.state.lock();
+            s.senders.insert(task.id, task.sender.clone());
+            s.attempts.entry(task.id).or_insert(0);
+            s.tasks.push_back(task);
+        }
+        self.task_notify.notify_one();
+        Ok(())
+    }
+
+    async fn recv_task(&self) -> Result<A2ATask, A2AError> {
+        loop {
+            {
+                let _g = self.file_lock.lock().await;
+                let front = self
+                    .state
+                    .lock()
+                    .tasks
+                    .front()
+                    .map(|t| (t.id, t.recipient.clone()));
+                if let Some((id, recipient)) = front {
+                    let lease_id = Uuid::new_v4();
+                    let leased_at_ms = epoch_ms();
+                    let attempt = self.state.lock().next_attempt(id);
+                    self.append(&MailboxEvent::TaskLeased {
+                        task_id: id,
+                        lease_id,
+                        leased_to: recipient,
+                        leased_at_ms,
+                        attempt,
+                    })
+                    .await?;
+                    if let Some(t) =
+                        self.state
+                            .lock()
+                            .lease_task(id, lease_id, None, leased_at_ms, attempt)
+                    {
+                        return Ok(t);
+                    }
+                }
+            }
+            self.task_notify.notified().await;
+        }
+    }
+
+    async fn try_recv_task_for(&self, recipient: &AgentId) -> Result<Option<A2ATask>, A2AError> {
+        let _g = self.file_lock.lock().await;
+        let target_id = {
+            let s = self.state.lock();
+            s.tasks
+                .iter()
+                .find(|t| t.recipient == *recipient)
+                .map(|t| t.id)
+        };
+        let Some(id) = target_id else { return Ok(None) };
+        let lease_id = Uuid::new_v4();
+        let leased_at_ms = epoch_ms();
+        let attempt = self.state.lock().next_attempt(id);
+        self.append(&MailboxEvent::TaskLeased {
+            task_id: id,
+            lease_id,
+            leased_to: recipient.clone(),
+            leased_at_ms,
+            attempt,
+        })
+        .await?;
+        let mut s = self.state.lock();
+        Ok(s.lease_task(id, lease_id, Some(recipient.clone()), leased_at_ms, attempt))
+    }
+
+    async fn send_result(&self, result: A2ATaskResult) -> Result<(), A2AError> {
+        let _g = self.file_lock.lock().await;
+        let cache_event = {
+            let s = self.state.lock();
+            s.in_flight
+                .get(&result.task_id)
+                .and_then(|lease| idempotency_cache_key(&lease.task))
+                .map(|cache_key| MailboxEvent::IdempotencyResultCached {
+                    cache_key,
+                    result: A2AIdempotencyCachedResult::from_result(&result),
+                })
+        };
+        self.append(&MailboxEvent::ResultPosted {
+            result: result.clone(),
+        })
+        .await?;
+        if let Some(event) = &cache_event {
+            self.append(event).await?;
+        }
+        let mut s = self.state.lock();
+        s.apply(MailboxEvent::ResultPosted { result });
+        if let Some(event) = cache_event {
+            s.apply(event);
+        }
+        self.result_notify.notify_one();
+        Ok(())
+    }
+
+    async fn recv_result(&self) -> Result<A2ATaskResult, A2AError> {
+        loop {
+            {
+                let _g = self.file_lock.lock().await;
+                let front_id = self.state.lock().results.front().map(|r| r.task_id);
+                if let Some(id) = front_id {
+                    self.append(&MailboxEvent::ResultRecv { task_id: id })
+                        .await?;
+                    if let Some(r) = self.state.lock().results.pop_front() {
+                        return Ok(r);
+                    }
+                }
+            }
+            self.result_notify.notified().await;
+        }
+    }
+
+    async fn try_recv_result_for(&self, peer: &AgentId) -> Result<Option<A2ATaskResult>, A2AError> {
+        let _g = self.file_lock.lock().await;
+        let target_task_id = {
+            let s = self.state.lock();
+            s.results.iter().find_map(|r| {
+                s.senders
+                    .get(&r.task_id)
+                    .filter(|sender| *sender == peer)
+                    .map(|_| r.task_id)
+            })
+        };
+        let Some(task_id) = target_task_id else {
+            return Ok(None);
+        };
+        self.append(&MailboxEvent::ResultRecv { task_id }).await?;
+        let mut s = self.state.lock();
+        let pos = s.results.iter().position(|r| r.task_id == task_id);
+        Ok(pos.and_then(|p| s.results.remove(p)))
+    }
+
+    async fn recent_tasks(&self, limit: usize) -> Result<Vec<A2ATask>, A2AError> {
+        Ok(self
+            .state
+            .lock()
+            .tasks
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn task_queue(&self, limit: usize) -> Result<Vec<A2ATaskQueueEntry>, A2AError> {
+        Ok(self.state.lock().task_queue(limit))
+    }
+
+    async fn repair_task(&self, request: A2ARepairRequest) -> Result<A2ARepairOutcome, A2AError> {
+        validate_repair_request(&request)?;
+        let _g = self.file_lock.lock().await;
+
+        match request.command {
+            A2ARepairCommand::Requeue {
+                lease_id,
+                duplicate_risk,
+            } => {
+                let lease = {
+                    let s = self.state.lock();
+                    s.in_flight
+                        .get(&request.task_id)
+                        .cloned()
+                        .ok_or(A2AError::TaskNotInFlight(request.task_id))?
+                };
+                assert_lease_match(request.task_id, lease_id, Some(lease.lease_id))?;
+                let event = MailboxEvent::TaskRequeued {
+                    task_id: request.task_id,
+                    lease_id: lease.lease_id,
+                    reason: request.reason,
+                    duplicate_risk,
+                    requeued_at_ms: epoch_ms(),
+                    attempt: lease.attempt,
+                };
+                self.append(&event).await?;
+                self.state.lock().apply(event);
+                self.task_notify.notify_one();
+                Ok(A2ARepairOutcome {
+                    task_id: request.task_id,
+                    action: A2ARepairAction::Requeued,
+                    state: A2ARepairState::Queued,
+                    attempt: lease.attempt,
+                    result: None,
+                })
+            }
+            A2ARepairCommand::ForceError { lease_id, message } => {
+                let lease = {
+                    let s = self.state.lock();
+                    s.in_flight
+                        .get(&request.task_id)
+                        .cloned()
+                        .ok_or(A2AError::TaskNotInFlight(request.task_id))?
+                };
+                assert_lease_match(request.task_id, lease_id, Some(lease.lease_id))?;
+                let result = A2ATaskResult::error(request.task_id, message);
+                let event = MailboxEvent::TaskForceErrored {
+                    task_id: request.task_id,
+                    lease_id: lease.lease_id,
+                    result: result.clone(),
+                    reason: request.reason,
+                    forced_at_ms: epoch_ms(),
+                    attempt: lease.attempt,
+                };
+                self.append(&event).await?;
+                self.state.lock().apply(event);
+                self.result_notify.notify_one();
+                Ok(A2ARepairOutcome {
+                    task_id: request.task_id,
+                    action: A2ARepairAction::ForcedError,
+                    state: A2ARepairState::ResultPending,
+                    attempt: lease.attempt,
+                    result: Some(result),
+                })
+            }
+        }
+    }
+
+    async fn recent_results(&self, limit: usize) -> Result<Vec<A2ATaskResult>, A2AError> {
+        Ok(self
+            .state
+            .lock()
+            .results
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn lookup_task_sender(&self, task_id: Uuid) -> Result<Option<AgentId>, A2AError> {
+        Ok(self.state.lock().senders.get(&task_id).cloned())
+    }
+
+    async fn compact(&self) -> Result<u64, A2AError> {
+        // Hold the file_lock across read-filter-rewrite so concurrent
+        // send/recv can't race with the rewrite. Atomicity comes from
+        // tempfile + rename.
+        let _g = self.file_lock.lock().await;
+
+        let raw = match fs::read_to_string(&self.path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let events: Vec<MailboxEvent> = raw
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let droppable = compute_droppable_task_ids(&events);
+        if droppable.is_empty() {
+            return Ok(0);
+        }
+        let kept: Vec<&MailboxEvent> = events
+            .iter()
+            .filter(|ev| !event_belongs_to_droppable(ev, &droppable))
+            .collect();
+        let dropped = (events.len() - kept.len()) as u64;
+        if dropped == 0 {
+            return Ok(0);
+        }
+
+        let tmp_path = self.path.with_extension("jsonl.tmp");
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await?;
+        for ev in &kept {
+            let line = serde_json::to_string(ev)?;
+            f.write_all(line.as_bytes()).await?;
+            f.write_all(b"\n").await?;
+        }
+        f.flush().await?;
+        drop(f);
+        fs::rename(&tmp_path, &self.path).await?;
+
+        // Mirror the on-disk drop into in-memory state so the senders
+        // map stays consistent without a reopen. Replay-on-open is the
+        // ground truth; this update is purely a perf shortcut.
+        let mut s = self.state.lock();
+        for tid in &droppable {
+            s.senders.remove(tid);
+            s.in_flight.remove(tid);
+            s.attempts.remove(tid);
+        }
+        s.result_cache
+            .retain(|_, v| !droppable.contains(&v.source_task_id));
+        Ok(dropped)
+    }
+}
+
+fn compute_droppable_task_ids(events: &[MailboxEvent]) -> HashSet<Uuid> {
+    // Per task_id: count delivery, ResultPosted, ResultRecv. TaskSent is
+    // implicit from membership in `seen`.
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    let mut delivered: HashSet<Uuid> = HashSet::new();
+    let mut posted: HashMap<Uuid, u64> = HashMap::new();
+    let mut drained: HashMap<Uuid, u64> = HashMap::new();
+    for ev in events {
+        match ev {
+            MailboxEvent::TaskSent { task } => {
+                seen.insert(task.id);
+            }
+            MailboxEvent::TaskRecv { task_id } => {
+                delivered.insert(*task_id);
+            }
+            MailboxEvent::TaskLeased { task_id, .. } => {
+                delivered.insert(*task_id);
+            }
+            MailboxEvent::TaskRequeued { .. } => {}
+            MailboxEvent::TaskForceErrored { result, .. } => {
+                *posted.entry(result.task_id).or_insert(0) += 1;
+            }
+            MailboxEvent::IdempotencyResultCached { .. } => {}
+            MailboxEvent::IdempotencyResultReplayed { task, result } => {
+                seen.insert(task.id);
+                delivered.insert(task.id);
+                *posted.entry(result.task_id).or_insert(0) += 1;
+            }
+            MailboxEvent::ResultPosted { result } => {
+                *posted.entry(result.task_id).or_insert(0) += 1;
+            }
+            MailboxEvent::ResultRecv { task_id } => {
+                *drained.entry(*task_id).or_insert(0) += 1;
+            }
+        }
+    }
+    seen.into_iter()
+        .filter(|tid| delivered.contains(tid))
+        .filter(|tid| {
+            let p = posted.get(tid).copied().unwrap_or(0);
+            let d = drained.get(tid).copied().unwrap_or(0);
+            p > 0 && p == d
+        })
+        .collect()
+}
+
+fn event_belongs_to_droppable(ev: &MailboxEvent, droppable: &HashSet<Uuid>) -> bool {
+    match ev {
+        MailboxEvent::TaskSent { task } => droppable.contains(&task.id),
+        MailboxEvent::TaskRecv { task_id } => droppable.contains(task_id),
+        MailboxEvent::TaskLeased { task_id, .. } => droppable.contains(task_id),
+        MailboxEvent::TaskRequeued { task_id, .. } => droppable.contains(task_id),
+        MailboxEvent::TaskForceErrored { task_id, .. } => droppable.contains(task_id),
+        // Drop the cache entry alongside its source task. Idempotency
+        // replay only protects against duplicates that arrive before
+        // compaction; once the source is fully drained, the cache
+        // entry's memory footprint must be reclaimable.
+        MailboxEvent::IdempotencyResultCached { result, .. } => {
+            droppable.contains(&result.source_task_id)
+        }
+        MailboxEvent::IdempotencyResultReplayed { task, .. } => droppable.contains(&task.id),
+        MailboxEvent::ResultPosted { result } => droppable.contains(&result.task_id),
+        MailboxEvent::ResultRecv { task_id } => droppable.contains(task_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_agent(name: &str) -> AgentId {
+        AgentId::new(name, [0u8; 32])
+    }
+
+    fn dummy_task() -> A2ATask {
+        A2ATask {
+            id: Uuid::new_v4(),
+            sender: dummy_agent("orchestrator@local"),
+            recipient: dummy_agent("research@local"),
+            intent_text: "find recent papers on agent memory".into(),
+            task_kind: None,
+            parent: None,
+            deadline_ms: None,
+            idempotency: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mailbox_open_rejects_malformed_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mailbox.jsonl");
+        // A non-empty row that is not a valid MailboxEvent must abort the
+        // replay loudly; a silent skip would drop queued task/result state.
+        tokio::fs::write(&path, b"{bad}\n")
+            .await
+            .expect("seed mailbox");
+        let err = JsonlMailbox::open(path)
+            .await
+            .err()
+            .expect("malformed row must abort replay");
+        assert!(
+            matches!(err, A2AError::Serde(_)),
+            "a malformed row must surface as A2AError::Serde, not a skipped or defaulted event: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_open_rejects_truncated_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mailbox.jsonl");
+        tokio::fs::write(&path, b"{\"task_\n")
+            .await
+            .expect("seed mailbox");
+        let err = JsonlMailbox::open(path)
+            .await
+            .err()
+            .expect("truncated frame must abort replay");
+        assert!(
+            matches!(err, A2AError::Serde(_)),
+            "a truncated JSON frame must surface as A2AError::Serde: {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_open_rejects_malformed_after_valid_rows() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mailbox.jsonl");
+        // Produce a genuinely valid event row via the real append path, then
+        // corrupt the log with a trailing malformed row.
+        {
+            let mailbox = JsonlMailbox::open(path.clone())
+                .await
+                .expect("open empty mailbox");
+            mailbox
+                .send_task(dummy_task())
+                .await
+                .expect("enqueue seeds one valid event row");
+        }
+        let mut f = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .expect("reopen log to corrupt it");
+        f.write_all(b"{bad}\n").await.expect("append malformed row");
+        f.flush().await.expect("flush");
+
+        let err = JsonlMailbox::open(path)
+            .await
+            .err()
+            .expect("a malformed row after valid rows must abort replay");
+        assert!(
+            matches!(err, A2AError::Serde(_)),
+            "replay must fail on the malformed row even after a valid row: {err:?}",
+        );
+    }
+
+    #[test]
+    fn task_round_trips_through_json() {
+        let t = dummy_task();
+        let s = serde_json::to_string(&t).unwrap();
+        assert!(s.contains("\"intent_text\":"));
+        let back: A2ATask = serde_json::from_str(&s).unwrap();
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn task_round_trips_idempotency_metadata() {
+        let mut t = dummy_task();
+        t.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "research:agent-memory:2026-05-09",
+        ));
+
+        let s = serde_json::to_string(&t).unwrap();
+        assert!(s.contains("\"duplicate_safety\":\"idempotent\""));
+        assert!(s.contains("\"key\":\"research:agent-memory:2026-05-09\""));
+
+        let back: A2ATask = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.idempotency, t.idempotency);
+    }
+
+    #[test]
+    fn task_round_trips_task_kind_metadata() {
+        let mut t = dummy_task();
+        t.task_kind = Some("research.lookup".into());
+
+        let s = serde_json::to_string(&t).unwrap();
+        assert!(s.contains("\"task_kind\":\"research.lookup\""));
+
+        let back: A2ATask = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.task_kind.as_deref(), Some("research.lookup"));
+    }
+
+    #[test]
+    fn task_deserializes_legacy_without_idempotency_metadata() {
+        let value = serde_json::json!({
+            "id": Uuid::nil(),
+            "sender": dummy_agent("orchestrator@local"),
+            "recipient": dummy_agent("research@local"),
+            "intent_text": "legacy task"
+        });
+
+        let task: A2ATask = serde_json::from_value(value).unwrap();
+        assert_eq!(task.id, Uuid::nil());
+        assert_eq!(task.idempotency, None);
+        assert_eq!(task.task_kind, None);
+    }
+
+    #[test]
+    fn auto_retry_policy_defaults_disabled() {
+        let policy = A2AAutoRetryPolicy::default();
+        assert!(!policy.enabled);
+        assert_eq!(policy.min_lease_age_ms, 300_000);
+        assert_eq!(policy.max_attempts, 3);
+        assert_eq!(policy.max_requeues, 1);
+        assert_eq!(policy.scan_limit, 100);
+    }
+
+    #[test]
+    fn auto_retry_policy_serde_pins_empty_object_matches_default() {
+        // Each A2AAutoRetryPolicy field carries a serde default: enabled rides
+        // bool::default()=false via #[serde(default)], and the other four ride
+        // module-local default_auto_retry_* functions via
+        // #[serde(default = "..."]). The Default impl threads through the same
+        // functions, so the contract is that decoding {} matches
+        // A2AAutoRetryPolicy::default(). A refactor that swaps the
+        // #[serde(default)] on enabled to a true-returning function, or
+        // repoints/drops any of the four function-backed defaults, would
+        // silently change retry behavior for every persisted config that
+        // omits a field.
+        let from_empty: A2AAutoRetryPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            from_empty,
+            A2AAutoRetryPolicy::default(),
+            "empty JSON object must round-trip to A2AAutoRetryPolicy::default(); a refactor of the serde defaults silently changes legacy config behavior"
+        );
+
+        let partial: A2AAutoRetryPolicy = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert!(
+            partial.enabled,
+            "partial decode must keep set fields verbatim"
+        );
+        assert_eq!(
+            partial.min_lease_age_ms, 300_000,
+            "min_lease_age_ms serde default must equal default_auto_retry_min_lease_age_ms() = 300_000"
+        );
+        assert_eq!(
+            partial.max_attempts, 3,
+            "max_attempts serde default must equal default_auto_retry_max_attempts() = 3"
+        );
+        assert_eq!(
+            partial.max_requeues, 1,
+            "max_requeues serde default must equal default_auto_retry_max_requeues() = 1"
+        );
+        assert_eq!(
+            partial.scan_limit, 100,
+            "scan_limit serde default must equal default_auto_retry_scan_limit() = 100"
+        );
+
+        let canonical = A2AAutoRetryPolicy::default();
+        let round_trip: A2AAutoRetryPolicy =
+            serde_json::from_value(serde_json::to_value(canonical).unwrap()).unwrap();
+        assert_eq!(
+            round_trip, canonical,
+            "Default policy must full-round-trip through serde without drift"
+        );
+
+        let explicit: A2AAutoRetryPolicy = serde_json::from_str(
+            r#"{"enabled": true, "min_lease_age_ms": 1, "max_attempts": 2, "max_requeues": 3, "scan_limit": 4}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit,
+            A2AAutoRetryPolicy {
+                enabled: true,
+                min_lease_age_ms: 1,
+                max_attempts: 2,
+                max_requeues: 3,
+                scan_limit: 4,
+            },
+            "explicit fields must decode verbatim; serde defaults must not shadow set values"
+        );
+    }
+
+    #[test]
+    fn auto_retry_policy_serde_pins_five_key_wire_shape() {
+        // auto_retry_policy_serde_pins_empty_object_matches_default covers
+        // the decode-time defaults: {} decodes to Default and each
+        // function-backed default value is checked. That test does NOT
+        // assert the serialize-time wire shape — a regression that added
+        // #[serde(skip_serializing_if)] to any of the five fields would
+        // silently shrink the wire object while still passing the
+        // empty-object round-trip check (absence decodes back to default).
+        // A2AAutoRetryPolicy embeds in A2AAutoRetryReport (the inner
+        // payload of Response::A2AAutoRetried) and is mirrored into
+        // AuditKind::A2AAutoRetrySchedulerScan, so operator dashboards
+        // and audit-replay consumers destructure on the five-key shape.
+        // Pin the closed key set and the per-key default value so a
+        // skip_serializing_if regression fails loud at the boundary.
+        let canonical = A2AAutoRetryPolicy::default();
+
+        let wire = serde_json::to_value(canonical).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("A2AAutoRetryPolicy serialises as a JSON object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "enabled",
+            "min_lease_age_ms",
+            "max_attempts",
+            "max_requeues",
+            "scan_limit",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            keys, expected,
+            "A2AAutoRetryPolicy wire form must be exactly five keys; \
+             a stray #[serde(skip_serializing_if)] on any field would \
+             silently drop the key whenever the value matched the default \
+             and operator dashboards would lose the policy field that the \
+             decode-time default-pin test cannot see",
+        );
+
+        assert_eq!(
+            obj.get("enabled"),
+            Some(&serde_json::json!(false)),
+            "Default enabled must surface as false on the wire — a \
+             skip_serializing_if = std::ops::Not::not regression would \
+             silently drop the key for the documented disabled-by-default \
+             posture",
+        );
+        assert_eq!(
+            obj.get("min_lease_age_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(300_000),
+            "Default min_lease_age_ms must surface as the function-backed \
+             default 300_000 — cross-binds the wire form to \
+             default_auto_retry_min_lease_age_ms()",
+        );
+        assert_eq!(
+            obj.get("max_attempts").and_then(serde_json::Value::as_u64),
+            Some(3),
+            "Default max_attempts must surface as the function-backed \
+             default 3 — cross-binds the wire form to \
+             default_auto_retry_max_attempts()",
+        );
+        assert_eq!(
+            obj.get("max_requeues").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "Default max_requeues must surface as the function-backed \
+             default 1 — cross-binds the wire form to \
+             default_auto_retry_max_requeues()",
+        );
+        assert_eq!(
+            obj.get("scan_limit").and_then(serde_json::Value::as_u64),
+            Some(100),
+            "Default scan_limit must surface as the function-backed \
+             default 100 — cross-binds the wire form to \
+             default_auto_retry_scan_limit()",
+        );
+
+        let back: A2AAutoRetryPolicy = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            back, canonical,
+            "Default policy must round-trip through serde_json verbatim — \
+             the Eq derive is the contract every audit-replay consumer leans on",
+        );
+    }
+
+    #[test]
+    fn auto_retry_evaluates_only_old_idempotent_in_flight_tasks() {
+        let mut task = dummy_task();
+        task.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "task:key",
+        ));
+        let entry = A2ATaskQueueEntry {
+            state: A2ATaskQueueState::InFlight,
+            task,
+            lease_id: Some(Uuid::nil()),
+            leased_to: Some(dummy_agent("research@local")),
+            leased_at_ms: Some(1_000),
+            attempt: 1,
+        };
+        let policy = A2AAutoRetryPolicy {
+            enabled: true,
+            min_lease_age_ms: 300_000,
+            max_attempts: 3,
+            max_requeues: 1,
+            scan_limit: 100,
+        };
+
+        let decision = evaluate_auto_retry(&entry, &policy, 301_000);
+        match decision {
+            A2AAutoRetryDecision::Requeue {
+                lease_id,
+                lease_age_ms,
+                idempotency_key,
+            } => {
+                assert_eq!(lease_id, Uuid::nil());
+                assert_eq!(lease_age_ms, 300_000);
+                assert_eq!(idempotency_key, "task:key");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_retry_rejects_unsafe_or_exhausted_tasks() {
+        let mut task = dummy_task();
+        task.idempotency = Some(A2AIdempotency::new(A2ADuplicateSafety::Unsafe, "task:key"));
+        let mut entry = A2ATaskQueueEntry {
+            state: A2ATaskQueueState::InFlight,
+            task,
+            lease_id: Some(Uuid::nil()),
+            leased_to: Some(dummy_agent("research@local")),
+            leased_at_ms: Some(1_000),
+            attempt: 1,
+        };
+        let policy = A2AAutoRetryPolicy {
+            enabled: true,
+            min_lease_age_ms: 0,
+            max_attempts: 3,
+            max_requeues: 1,
+            scan_limit: 100,
+        };
+
+        assert!(matches!(
+            evaluate_auto_retry(&entry, &policy, 1_000),
+            A2AAutoRetryDecision::Skip {
+                reason: A2AAutoRetrySkipReason::UnsafeDuplicateSafety,
+                ..
+            }
+        ));
+
+        entry.task.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "task:key",
+        ));
+        entry.attempt = 3;
+        assert!(matches!(
+            evaluate_auto_retry(&entry, &policy, 1_000),
+            A2AAutoRetryDecision::Skip {
+                reason: A2AAutoRetrySkipReason::MaxAttemptsReached,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn evaluate_auto_retry_pins_remaining_skip_reason_arms() {
+        // evaluate_auto_retry is a seven-arm decision function. Three
+        // arms are pinned by neighbouring tests: Requeue
+        // (auto_retry_evaluates_only_old_idempotent_in_flight_tasks),
+        // UnsafeDuplicateSafety + MaxAttemptsReached
+        // (auto_retry_rejects_unsafe_or_exhausted_tasks). The five
+        // remaining Skip reasons — Disabled, NotInFlight, MissingLease,
+        // LeaseTooYoung, MissingIdempotency (both the
+        // entry.task.idempotency=None path and the empty-key path) —
+        // encode the daemon scheduler's short-circuit ladder. A
+        // refactor that reordered the checks, flipped a comparison
+        // (e.g., < to <= on the lease-age gate), or merged two
+        // reasons into one would silently shift the
+        // AuditKind::A2AAutoRetrySchedulerScan.skipped_by_reason
+        // histogram across daemon restarts with no compile-time
+        // signal and no operator-visible diagnostic beyond a subtle
+        // shift in retry rates.
+        //
+        // Each arm pins both the reason variant AND the lease_age_ms
+        // shape: Skip arms that fire before lease-age computation
+        // (Disabled, NotInFlight, MissingLease) carry
+        // lease_age_ms=None; arms that fire after (LeaseTooYoung,
+        // MissingIdempotency) carry Some(lease_age) so audit rows
+        // can attribute the skip to a specific lease.
+        fn baseline_entry() -> A2ATaskQueueEntry {
+            let mut task = dummy_task();
+            task.idempotency = Some(A2AIdempotency::new(
+                A2ADuplicateSafety::Idempotent,
+                "task:key",
+            ));
+            A2ATaskQueueEntry {
+                state: A2ATaskQueueState::InFlight,
+                task,
+                lease_id: Some(Uuid::nil()),
+                leased_to: Some(dummy_agent("research@local")),
+                leased_at_ms: Some(1_000),
+                attempt: 1,
+            }
+        }
+        let baseline_policy = A2AAutoRetryPolicy {
+            enabled: true,
+            min_lease_age_ms: 300_000,
+            max_attempts: 3,
+            max_requeues: 1,
+            scan_limit: 100,
+        };
+
+        let mut disabled_policy = baseline_policy;
+        disabled_policy.enabled = false;
+        match evaluate_auto_retry(&baseline_entry(), &disabled_policy, 301_000) {
+            A2AAutoRetryDecision::Skip {
+                reason: A2AAutoRetrySkipReason::Disabled,
+                lease_age_ms,
+            } => assert_eq!(
+                lease_age_ms, None,
+                "Disabled fires before any lease-age computation; \
+                 lease_age_ms must be None so audit rows do not \
+                 attribute the skip to a specific lease — a refactor \
+                 that moved this check below the lease-age branch \
+                 would surface Some(lease_age) here and mislead \
+                 operators investigating disabled-scheduler scans",
+            ),
+            other => panic!(
+                "policy.enabled=false must return Skip(Disabled); a \
+                 refactor that moved the disabled check below \
+                 NotInFlight/MissingLease/etc would mask the \
+                 disabled-scheduler diagnostic behind downstream-arm \
+                 histograms; got {other:?}"
+            ),
+        }
+
+        let mut not_in_flight = baseline_entry();
+        not_in_flight.state = A2ATaskQueueState::Queued;
+        match evaluate_auto_retry(&not_in_flight, &baseline_policy, 301_000) {
+            A2AAutoRetryDecision::Skip {
+                reason: A2AAutoRetrySkipReason::NotInFlight,
+                lease_age_ms,
+            } => assert_eq!(
+                lease_age_ms, None,
+                "NotInFlight also fires before lease-age computation; \
+                 lease_age_ms must be None — a refactor that fell \
+                 through to compute lease_age before the state check \
+                 would surface Some on entries that have a leased_at \
+                 even though their state is Queued",
+            ),
+            other => panic!(
+                "entry.state != InFlight must return Skip(NotInFlight); \
+                 got {other:?}"
+            ),
+        }
+
+        let mut missing_lease_id = baseline_entry();
+        missing_lease_id.lease_id = None;
+        match evaluate_auto_retry(&missing_lease_id, &baseline_policy, 301_000) {
+            A2AAutoRetryDecision::Skip {
+                reason: A2AAutoRetrySkipReason::MissingLease,
+                lease_age_ms,
+            } => assert_eq!(
+                lease_age_ms, None,
+                "MissingLease still fires before the lease-age \
+                 computation; even if leased_at_ms is set, a missing \
+                 lease_id should surface Skip(MissingLease, None) — \
+                 a refactor that decoupled the two None checks would \
+                 surface Some(lease_age) here and conflate \
+                 partial-lease-data tasks with stale-lease tasks",
+            ),
+            other => panic!(
+                "entry.lease_id=None must return Skip(MissingLease); \
+                 got {other:?}"
+            ),
+        }
+
+        let mut missing_leased_at = baseline_entry();
+        missing_leased_at.leased_at_ms = None;
+        match evaluate_auto_retry(&missing_leased_at, &baseline_policy, 301_000) {
+            A2AAutoRetryDecision::Skip {
+                reason: A2AAutoRetrySkipReason::MissingLease,
+                lease_age_ms,
+            } => assert_eq!(
+                lease_age_ms, None,
+                "MissingLease must also fire when leased_at_ms is \
+                 None even if lease_id is set — both Options are \
+                 collapsed into the same Skip reason because the \
+                 audit row's lease attribution requires both",
+            ),
+            other => panic!(
+                "entry.leased_at_ms=None must return Skip(MissingLease); \
+                 got {other:?}"
+            ),
+        }
+
+        let too_young = baseline_entry();
+        let half_min = baseline_policy.min_lease_age_ms / 2;
+        let now_for_young = too_young.leased_at_ms.unwrap() + half_min;
+        match evaluate_auto_retry(&too_young, &baseline_policy, now_for_young) {
+            A2AAutoRetryDecision::Skip {
+                reason: A2AAutoRetrySkipReason::LeaseTooYoung,
+                lease_age_ms,
+            } => assert_eq!(
+                lease_age_ms,
+                Some(half_min),
+                "LeaseTooYoung fires AFTER lease-age computation so \
+                 the audit row can attribute the skip to a specific \
+                 lease age — lease_age_ms must surface Some(actual \
+                 age) not None; a refactor that flipped the < to <= \
+                 on the comparison would silently shift exactly-at-\
+                 boundary leases between LeaseTooYoung and downstream \
+                 arms",
+            ),
+            other => panic!(
+                "lease_age_ms < min_lease_age_ms must return \
+                 Skip(LeaseTooYoung); got {other:?}"
+            ),
+        }
+
+        let mut no_idem = baseline_entry();
+        no_idem.task.idempotency = None;
+        match evaluate_auto_retry(&no_idem, &baseline_policy, 301_000) {
+            A2AAutoRetryDecision::Skip {
+                reason: A2AAutoRetrySkipReason::MissingIdempotency,
+                lease_age_ms,
+            } => assert_eq!(
+                lease_age_ms,
+                Some(300_000),
+                "MissingIdempotency fires after lease-age \
+                 computation; lease_age_ms must surface the actual \
+                 lease age so audit rows attribute the skip to a \
+                 specific lease — a refactor that moved the \
+                 idempotency check before the lease-age computation \
+                 would surface None here and break the audit-row \
+                 attribution",
+            ),
+            other => panic!(
+                "entry.task.idempotency=None must return \
+                 Skip(MissingIdempotency); got {other:?}"
+            ),
+        }
+
+        let mut empty_idem = baseline_entry();
+        empty_idem.task.idempotency =
+            Some(A2AIdempotency::new(A2ADuplicateSafety::Idempotent, "   "));
+        match evaluate_auto_retry(&empty_idem, &baseline_policy, 301_000) {
+            A2AAutoRetryDecision::Skip {
+                reason: A2AAutoRetrySkipReason::MissingIdempotency,
+                lease_age_ms,
+            } => assert_eq!(
+                lease_age_ms,
+                Some(300_000),
+                "A whitespace-only idempotency key must collapse to \
+                 MissingIdempotency (the key.trim().is_empty() \
+                 branch at line 353) so a sender that writes ' ' or \
+                 '\\t' does not falsely satisfy the idempotency \
+                 contract; a refactor that dropped the trim would \
+                 let whitespace keys through and the receiver-side \
+                 cache would treat them as distinct from empty",
+            ),
+            other => panic!(
+                "whitespace-only idempotency key must return \
+                 Skip(MissingIdempotency); got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a2a_task_status_serde_pins_snake_case_wire_form() {
+        // A2ATaskStatus rides inside A2ATaskResult and the receiver-side
+        // A2AIdempotencyCachedResult JSON. Both are persisted across
+        // daemon restarts, so a slug rename without a migration would
+        // silently fail to deserialize every previously cached result.
+        let cases: [(A2ATaskStatus, &str); 3] = [
+            (A2ATaskStatus::Ok, "ok"),
+            (A2ATaskStatus::Error, "error"),
+            (A2ATaskStatus::Partial, "partial"),
+        ];
+        for (variant, slug) in cases {
+            let wire = serde_json::to_string(&variant).unwrap();
+            assert_eq!(wire, format!("\"{slug}\""));
+            let back: A2ATaskStatus = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, variant);
+        }
+
+        // The snake_case whitelist must reject other casings so a future
+        // permissive arm cannot silently absorb mis-cased upstream JSON.
+        assert!(serde_json::from_str::<A2ATaskStatus>("\"Ok\"").is_err());
+        assert!(serde_json::from_str::<A2ATaskStatus>("\"error-partial\"").is_err());
+    }
+
+    #[test]
+    fn a2a_auto_retry_skip_reason_as_str_pins_each_variant_slug() {
+        // The slugs flow into norend::record_a2a_auto_retry_scheduler_scan
+        // as keys in a BTreeMap<String, u64> of skipped-by-reason counters,
+        // and from there into audit rows and downstream dashboards. A
+        // renamed or swapped slug splits the same bucket across two names
+        // silently. Pin every variant explicitly so adding a new variant
+        // forces the author to extend this array AND the as_str() arm.
+        let cases: [(A2AAutoRetrySkipReason, &str); 9] = [
+            (A2AAutoRetrySkipReason::Disabled, "disabled"),
+            (A2AAutoRetrySkipReason::NotInFlight, "not_in_flight"),
+            (A2AAutoRetrySkipReason::MissingLease, "missing_lease"),
+            (A2AAutoRetrySkipReason::LeaseTooYoung, "lease_too_young"),
+            (
+                A2AAutoRetrySkipReason::MissingIdempotency,
+                "missing_idempotency",
+            ),
+            (
+                A2AAutoRetrySkipReason::UnsafeDuplicateSafety,
+                "unsafe_duplicate_safety",
+            ),
+            (
+                A2AAutoRetrySkipReason::MaxAttemptsReached,
+                "max_attempts_reached",
+            ),
+            (A2AAutoRetrySkipReason::LimitReached, "limit_reached"),
+            (
+                A2AAutoRetrySkipReason::CapabilityScopeMismatch,
+                "capability_scope_mismatch",
+            ),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(
+                reason.as_str(),
+                expected,
+                "{reason:?} must keep its documented slug; if this fires after \
+                 renaming a variant, update the BTreeMap consumers in \
+                 norend::record_a2a_auto_retry_scheduler_scan and any \
+                 downstream dashboards before changing the slug",
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_auto_retry_skip_reason_serde_pins_each_snake_case_slug() {
+        // A2AAutoRetrySkipReason carries rename_all = snake_case and rides
+        // inside every A2AAutoRetrySkipped report serialized over IPC,
+        // HTTP, and CLI. The slugs are also pinned via
+        // A2AAutoRetrySkipReason::as_str for the BTreeMap key into
+        // A2AAutoRetrySchedulerScan audit rows.
+        // The two surfaces share the same exhaustive table but route
+        // through independent code paths: a refactor that drops the
+        // rename_all attribute on the enum would silently switch the
+        // Serialize side to titlecase variant names while leaving the
+        // manual as_str() arms intact, splitting the same skip bucket
+        // across two names in operator dashboards joining the JSON
+        // report against the audit BTreeMap. Pin the serde wire form
+        // and assert serde-vs-as_str parity so the two surfaces cannot
+        // drift apart silently.
+        let cases: [(A2AAutoRetrySkipReason, &str); 9] = [
+            (A2AAutoRetrySkipReason::Disabled, "disabled"),
+            (A2AAutoRetrySkipReason::NotInFlight, "not_in_flight"),
+            (A2AAutoRetrySkipReason::MissingLease, "missing_lease"),
+            (A2AAutoRetrySkipReason::LeaseTooYoung, "lease_too_young"),
+            (
+                A2AAutoRetrySkipReason::MissingIdempotency,
+                "missing_idempotency",
+            ),
+            (
+                A2AAutoRetrySkipReason::UnsafeDuplicateSafety,
+                "unsafe_duplicate_safety",
+            ),
+            (
+                A2AAutoRetrySkipReason::MaxAttemptsReached,
+                "max_attempts_reached",
+            ),
+            (A2AAutoRetrySkipReason::LimitReached, "limit_reached"),
+            (
+                A2AAutoRetrySkipReason::CapabilityScopeMismatch,
+                "capability_scope_mismatch",
+            ),
+        ];
+        for (reason, expected) in cases {
+            let wire = serde_json::to_string(&reason).unwrap();
+            assert_eq!(
+                wire,
+                format!("\"{expected}\""),
+                "{reason:?} must serialize to {expected:?}; a dropped rename_all \
+                 would emit titlecase variants here while as_str keeps emitting \
+                 snake_case, splitting the JSON report and the audit BTreeMap",
+            );
+            let back: A2AAutoRetrySkipReason = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, reason);
+            assert_eq!(
+                reason.as_str(),
+                expected,
+                "as_str slug must equal the serde slug for {reason:?}; if this \
+                 fires the two surfaces have diverged and operator dashboards \
+                 will key one bucket under two names",
+            );
+        }
+
+        // Dropping rename_all would surface variant names verbatim
+        // (NotInFlight); the snake_case whitelist must reject that
+        // form so the regression fails loud at parse time.
+        assert!(
+            serde_json::from_str::<A2AAutoRetrySkipReason>("\"NotInFlight\"").is_err(),
+            "titlecase NotInFlight (the rename_all default) must be rejected",
+        );
+        // kebab-case must also fail — the contract is snake_case only.
+        assert!(
+            serde_json::from_str::<A2AAutoRetrySkipReason>("\"not-in-flight\"").is_err(),
+            "kebab-case must be rejected so the snake_case whitelist stays tight",
+        );
+    }
+
+    #[test]
+    fn a2a_repair_action_serde_pins_snake_case_wire_form() {
+        // A2ARepairAction is the discriminator on every A2ARepairOutcome
+        // emitted by manual and scheduled repair flows; the slug lands in
+        // daemon repair audit rows and downstream operator dashboards.
+        // ForcedError is load-bearing — the rename_all default would emit
+        // "ForcedError" titlecase and silently bisect repair telemetry.
+        let cases: [(A2ARepairAction, &str); 2] = [
+            (A2ARepairAction::Requeued, "requeued"),
+            (A2ARepairAction::ForcedError, "forced_error"),
+        ];
+        for (variant, slug) in cases {
+            let wire = serde_json::to_string(&variant).unwrap();
+            assert_eq!(wire, format!("\"{slug}\""));
+            let back: A2ARepairAction = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, variant);
+        }
+
+        assert!(
+            serde_json::from_str::<A2ARepairAction>("\"ForcedError\"").is_err(),
+            "titlecase ForcedError (the rename_all default) must be rejected",
+        );
+        assert!(
+            serde_json::from_str::<A2ARepairAction>("\"forcedError\"").is_err(),
+            "camelCase forcedError must be rejected so the snake_case whitelist stays tight",
+        );
+    }
+
+    #[test]
+    fn a2a_repair_command_serde_pins_each_snake_case_action_slug() {
+        // A2ARepairCommand carries #[serde(tag = "action", rename_all =
+        // "snake_case")] and rides inside every A2ARepairRequest
+        // dispatched through daemon, HTTP, and CLI A2A repair flows.
+        // The discriminator name "action" is load-bearing — a refactor
+        // to the serde default tag "type" would silently break every
+        // CLI-built repair payload still keying on action. The
+        // rename_all attribute is similarly load-bearing — its drop
+        // would emit titlecase Requeue/ForceError variants in the
+        // wire JSON while sibling A2ARepairAction (already pinned)
+        // kept its snake_case slugs, splitting a2a_repair_action audit
+        // consumers across two forms. Pin both the tag name and the
+        // per-variant snake_case slug, exercising the #[serde(default,
+        // skip_serializing_if = "Option::is_none")] lease_id field on
+        // both arms.
+        let lease = Uuid::new_v4();
+
+        let requeue_no_lease = A2ARepairCommand::Requeue {
+            lease_id: None,
+            duplicate_risk: A2ADuplicateRisk::Idempotent,
+        };
+        let requeue_no_lease_wire = serde_json::json!({
+            "action": "requeue",
+            "duplicate_risk": "idempotent",
+        });
+        assert_eq!(
+            serde_json::to_value(&requeue_no_lease).unwrap(),
+            requeue_no_lease_wire,
+        );
+        assert_eq!(
+            serde_json::from_value::<A2ARepairCommand>(requeue_no_lease_wire).unwrap(),
+            requeue_no_lease,
+        );
+
+        let requeue_with_lease = A2ARepairCommand::Requeue {
+            lease_id: Some(lease),
+            duplicate_risk: A2ADuplicateRisk::OperatorAccepted,
+        };
+        let requeue_with_lease_wire = serde_json::json!({
+            "action": "requeue",
+            "lease_id": lease,
+            "duplicate_risk": "operator_accepted",
+        });
+        assert_eq!(
+            serde_json::to_value(&requeue_with_lease).unwrap(),
+            requeue_with_lease_wire,
+        );
+        assert_eq!(
+            serde_json::from_value::<A2ARepairCommand>(requeue_with_lease_wire).unwrap(),
+            requeue_with_lease,
+        );
+
+        let force_no_lease = A2ARepairCommand::ForceError {
+            lease_id: None,
+            message: "x".into(),
+        };
+        let force_no_lease_wire = serde_json::json!({
+            "action": "force_error",
+            "message": "x",
+        });
+        assert_eq!(
+            serde_json::to_value(&force_no_lease).unwrap(),
+            force_no_lease_wire,
+        );
+        assert_eq!(
+            serde_json::from_value::<A2ARepairCommand>(force_no_lease_wire).unwrap(),
+            force_no_lease,
+        );
+
+        let force_with_lease = A2ARepairCommand::ForceError {
+            lease_id: Some(lease),
+            message: "x".into(),
+        };
+        let force_with_lease_wire = serde_json::json!({
+            "action": "force_error",
+            "lease_id": lease,
+            "message": "x",
+        });
+        assert_eq!(
+            serde_json::to_value(&force_with_lease).unwrap(),
+            force_with_lease_wire,
+        );
+        assert_eq!(
+            serde_json::from_value::<A2ARepairCommand>(force_with_lease_wire).unwrap(),
+            force_with_lease,
+        );
+
+        // Dropping rename_all would surface variant names verbatim
+        // (Requeue); the snake_case whitelist must reject that form
+        // so the regression fails loud.
+        assert!(
+            serde_json::from_value::<A2ARepairCommand>(serde_json::json!({
+                "action": "Requeue",
+                "duplicate_risk": "idempotent",
+            }))
+            .is_err(),
+            "titlecase action slug (the rename_all default) must be rejected",
+        );
+
+        // Switching the tag from "action" to the serde default "type"
+        // would silently break every CLI repair payload. Pin the tag
+        // name so a refactor that drops tag = "action" fails loud at
+        // the boundary instead of through a confusing upstream error.
+        assert!(
+            serde_json::from_value::<A2ARepairCommand>(serde_json::json!({
+                "type": "requeue",
+                "duplicate_risk": "idempotent",
+            }))
+            .is_err(),
+            "wrong discriminator name (serde default 'type') must be rejected",
+        );
+    }
+
+    #[test]
+    fn a2a_repair_request_serde_pins_three_required_fields() {
+        // A2ARepairRequest is the request envelope every daemon, HTTP,
+        // and CLI A2A repair command dispatches through. Three strictly
+        // required fields with no serde attributes: task_id (Uuid),
+        // command (A2ARepairCommand — the tagged enum pinned by
+        // a2a_repair_command_serde_pins_each_snake_case_action_slug),
+        // reason (String). A refactor that flattened command into the
+        // top-level envelope would leak the inner "action" discriminator
+        // to the request shape; renaming reason would silently break
+        // audit attribution on every repaired task; adding
+        // skip_serializing_if = String::is_empty to reason would hide
+        // un-attributed repair rows from operator dashboards that grep
+        // on key presence.
+        let request = A2ARepairRequest {
+            task_id: Uuid::nil(),
+            command: A2ARepairCommand::ForceError {
+                lease_id: None,
+                message: "boom".into(),
+            },
+            reason: "manual".into(),
+        };
+
+        let wire = serde_json::to_value(&request).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("A2ARepairRequest serialises as a JSON object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["task_id", "command", "reason"].into_iter().collect();
+        assert_eq!(
+            keys, expected,
+            "A2ARepairRequest wire form must be exactly three keys; a \
+             #[serde(flatten)] on command would leak the inner action \
+             discriminator to the envelope, and a skip_serializing_if on \
+             reason would silently drop audit attribution",
+        );
+
+        // Cross-bind to A2ARepairCommand's #[serde(tag = "action",
+        // rename_all = "snake_case")] contract: the command value must
+        // carry an inner "action" discriminator with the snake_case
+        // slug, not a top-level discriminator the envelope would expose
+        // if command were flattened.
+        let command_obj = obj
+            .get("command")
+            .and_then(serde_json::Value::as_object)
+            .expect("command must serialise as a nested JSON object");
+        assert_eq!(
+            command_obj.get("action"),
+            Some(&serde_json::json!("force_error")),
+            "command must carry the inner action discriminator with the \
+             snake_case slug; a flatten would lift action to the envelope",
+        );
+        assert!(
+            !obj.contains_key("action"),
+            "envelope must not expose action at the top level — that \
+             would mean command was flattened",
+        );
+
+        // Round-trip pins the PartialEq + Eq derive contract.
+        let back: A2ARepairRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back, request);
+
+        // Each strictly-required field must reject when omitted.
+        for required in ["task_id", "command", "reason"] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<A2ARepairRequest>(serde_json::Value::Object(missing))
+                    .is_err(),
+                "A2ARepairRequest wire form must reject a payload missing {required:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_repair_outcome_serde_pins_four_required_and_result_skip_empty() {
+        // A2ARepairOutcome is the audit row every A2A repair flow
+        // returns. Four strictly required fields — task_id, action,
+        // state, attempt — plus an optional result that carries
+        // #[serde(default, skip_serializing_if = "Option::is_none")].
+        // Dropping skip_serializing_if would emit "result": null on
+        // every queued (not-yet-resolved) repair row and silently
+        // inflate the size of audit dashboards that count rows with a
+        // result. Dropping #[serde(default)] would refuse to decode any
+        // historical row that omitted result. Renaming attempt would
+        // silently bisect the retry-counter column. Pin the shape on
+        // both the None and Some paths, the per-required-field reject
+        // loop, the omitted-result decode, and the cross-binding to the
+        // snake_case action/state slugs already pinned by the sibling
+        // enum tests.
+        let none_outcome = A2ARepairOutcome {
+            task_id: Uuid::nil(),
+            action: A2ARepairAction::Requeued,
+            state: A2ARepairState::Queued,
+            attempt: 1,
+            result: None,
+        };
+
+        let none_wire = serde_json::to_value(&none_outcome).unwrap();
+        let none_obj = none_wire
+            .as_object()
+            .expect("A2ARepairOutcome serialises as a JSON object");
+        let none_keys: std::collections::BTreeSet<&str> =
+            none_obj.keys().map(String::as_str).collect();
+        let four: std::collections::BTreeSet<&str> = ["task_id", "action", "state", "attempt"]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            none_keys, four,
+            "A2ARepairOutcome with result=None must be exactly four keys; \
+             dropping skip_serializing_if would silently emit result: null \
+             on every queued repair row",
+        );
+        assert_eq!(none_obj.get("action"), Some(&serde_json::json!("requeued")));
+        assert_eq!(none_obj.get("state"), Some(&serde_json::json!("queued")));
+
+        let some_outcome = A2ARepairOutcome {
+            task_id: Uuid::nil(),
+            action: A2ARepairAction::Requeued,
+            state: A2ARepairState::Queued,
+            attempt: 1,
+            result: Some(A2ATaskResult {
+                task_id: Uuid::nil(),
+                status: A2ATaskStatus::Error,
+                content: vec![],
+                error_message: Some("boom".into()),
+            }),
+        };
+
+        let some_wire = serde_json::to_value(&some_outcome).unwrap();
+        let some_obj = some_wire.as_object().unwrap();
+        let some_keys: std::collections::BTreeSet<&str> =
+            some_obj.keys().map(String::as_str).collect();
+        let five: std::collections::BTreeSet<&str> =
+            ["task_id", "action", "state", "attempt", "result"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            some_keys, five,
+            "A2ARepairOutcome with result=Some must surface result on the wire",
+        );
+
+        // Round-trip pins the PartialEq derive contract on both paths.
+        let back_none: A2ARepairOutcome = serde_json::from_value(none_wire.clone()).unwrap();
+        assert_eq!(back_none, none_outcome);
+        let back_some: A2ARepairOutcome = serde_json::from_value(some_wire).unwrap();
+        assert_eq!(back_some, some_outcome);
+
+        // Decoding a payload that omits result must succeed and yield
+        // result=None — the #[serde(default)] path covers historical
+        // rows persisted before the field existed.
+        let omitted: A2ARepairOutcome = serde_json::from_value(serde_json::json!({
+            "task_id": Uuid::nil(),
+            "action": "requeued",
+            "state": "queued",
+            "attempt": 1,
+        }))
+        .unwrap();
+        assert_eq!(omitted.result, None);
+
+        // Each strictly-required field must reject when omitted.
+        for required in ["task_id", "action", "state", "attempt"] {
+            let mut missing = none_obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<A2ARepairOutcome>(serde_json::Value::Object(missing))
+                    .is_err(),
+                "A2ARepairOutcome wire form must reject a payload missing {required:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_repair_state_serde_pins_snake_case_wire_form() {
+        // A2ARepairState rides next to A2ARepairAction inside every
+        // A2ARepairOutcome audit row. ResultPending is load-bearing —
+        // the rename_all default would emit "ResultPending" titlecase
+        // and downstream operator dashboards keyed on result_pending
+        // would silently undercount in-flight repairs.
+        let cases: [(A2ARepairState, &str); 2] = [
+            (A2ARepairState::Queued, "queued"),
+            (A2ARepairState::ResultPending, "result_pending"),
+        ];
+        for (variant, slug) in cases {
+            let wire = serde_json::to_string(&variant).unwrap();
+            assert_eq!(wire, format!("\"{slug}\""));
+            let back: A2ARepairState = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, variant);
+        }
+
+        assert!(
+            serde_json::from_str::<A2ARepairState>("\"ResultPending\"").is_err(),
+            "titlecase ResultPending (the rename_all default) must be rejected",
+        );
+        assert!(
+            serde_json::from_str::<A2ARepairState>("\"resultPending\"").is_err(),
+            "camelCase resultPending must be rejected so the snake_case whitelist stays tight",
+        );
+    }
+
+    #[test]
+    fn a2a_duplicate_risk_serde_pins_snake_case_wire_form() {
+        // A2ADuplicateRisk rides on every A2ARepairCommand::Requeue and
+        // lands in the daemon's repair audit row. OperatorAccepted is
+        // load-bearing — it records that a human operator explicitly
+        // authorized requeueing a non-idempotent task. The rename_all
+        // default would emit "OperatorAccepted" titlecase and silently
+        // bisect operator-acceptance audit rows.
+        let cases: [(A2ADuplicateRisk, &str); 2] = [
+            (A2ADuplicateRisk::Idempotent, "idempotent"),
+            (A2ADuplicateRisk::OperatorAccepted, "operator_accepted"),
+        ];
+        for (variant, slug) in cases {
+            let wire = serde_json::to_string(&variant).unwrap();
+            assert_eq!(wire, format!("\"{slug}\""));
+            let back: A2ADuplicateRisk = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, variant);
+        }
+
+        assert!(
+            serde_json::from_str::<A2ADuplicateRisk>("\"OperatorAccepted\"").is_err(),
+            "titlecase OperatorAccepted (the rename_all default) must be rejected",
+        );
+        assert!(
+            serde_json::from_str::<A2ADuplicateRisk>("\"operatorAccepted\"").is_err(),
+            "camelCase operatorAccepted must be rejected so the snake_case whitelist stays tight",
+        );
+    }
+
+    #[test]
+    fn a2a_task_queue_state_serde_pins_snake_case_wire_form() {
+        // A2ATaskQueueState rides on every persisted A2ATaskQueueEntry.
+        // InFlight is load-bearing — a daemon restarting against a
+        // queue file that emitted "InFlight" titlecase (the rename_all
+        // default) would silently fail to deserialize half the rows
+        // and forget every leased task.
+        let cases: [(A2ATaskQueueState, &str); 2] = [
+            (A2ATaskQueueState::Queued, "queued"),
+            (A2ATaskQueueState::InFlight, "in_flight"),
+        ];
+        for (variant, slug) in cases {
+            let wire = serde_json::to_string(&variant).unwrap();
+            assert_eq!(wire, format!("\"{slug}\""));
+            let back: A2ATaskQueueState = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, variant);
+        }
+
+        assert!(
+            serde_json::from_str::<A2ATaskQueueState>("\"InFlight\"").is_err(),
+            "titlecase InFlight (the rename_all default) must be rejected",
+        );
+        assert!(
+            serde_json::from_str::<A2ATaskQueueState>("\"inFlight\"").is_err(),
+            "camelCase inFlight must be rejected so the snake_case whitelist stays tight",
+        );
+    }
+
+    #[test]
+    fn task_queue_entry_serde_pins_lease_metadata_skip_empty_and_attempt_default() {
+        // A2ATaskQueueEntry is the persisted JSONL row written by
+        // JsonlMailbox on every queue change and read back by daemon
+        // restart. lease_id, leased_to, and leased_at_ms each carry
+        // #[serde(default, skip_serializing_if = "Option::is_none")] so
+        // queued (not-yet-leased) entries stay compact on disk without
+        // three null fields, and attempt rides #[serde(default)] so
+        // legacy queued JSONL rows written before the retry-counter
+        // feature decode as attempt=0 instead of failing the replay.
+        let task = dummy_task();
+        let queued = A2ATaskQueueEntry::queued(task.clone());
+        let wire = serde_json::to_value(&queued).unwrap();
+        let obj = wire.as_object().expect("wire form must be a JSON object");
+        for absent in ["lease_id", "leased_to", "leased_at_ms"] {
+            assert!(
+                !obj.contains_key(absent),
+                "queued entries must skip {absent} on the wire; a dropped skip_serializing_if inflates every queued JSONL row with three null fields",
+            );
+        }
+        assert_eq!(
+            wire.get("attempt").and_then(|v| v.as_u64()),
+            Some(0),
+            "attempt must surface as 0 explicitly on queued entries; there is no skip_serializing_if on the field",
+        );
+
+        let lease_id = Uuid::nil();
+        let leased_to = dummy_agent("research@local");
+        let in_flight = A2ATaskQueueEntry {
+            state: A2ATaskQueueState::InFlight,
+            task,
+            lease_id: Some(lease_id),
+            leased_to: Some(leased_to.clone()),
+            leased_at_ms: Some(1_700_000_000_000),
+            attempt: 2,
+        };
+        let wire = serde_json::to_value(&in_flight).unwrap();
+        assert_eq!(
+            wire.get("lease_id").and_then(|v| v.as_str()),
+            Some(lease_id.to_string().as_str()),
+            "in-flight lease_id must surface verbatim",
+        );
+        assert!(
+            wire.get("leased_to").is_some(),
+            "in-flight leased_to must surface on the wire",
+        );
+        assert_eq!(
+            wire.get("leased_at_ms").and_then(|v| v.as_u64()),
+            Some(1_700_000_000_000),
+        );
+        assert_eq!(wire.get("attempt").and_then(|v| v.as_u64()), Some(2));
+
+        let legacy: A2ATaskQueueEntry = serde_json::from_value(serde_json::json!({
+            "state": "queued",
+            "task": serde_json::to_value(dummy_task()).unwrap(),
+        }))
+        .expect("legacy JSONL row that omits all lease metadata and attempt must decode");
+        assert_eq!(legacy.state, A2ATaskQueueState::Queued);
+        assert_eq!(legacy.lease_id, None);
+        assert_eq!(legacy.leased_to, None);
+        assert_eq!(legacy.leased_at_ms, None);
+        assert_eq!(
+            legacy.attempt, 0,
+            "legacy queued row must decode attempt as 0 via #[serde(default)]; a dropped attribute bricks every pre-retry queue replay",
+        );
+
+        let round_trip: A2ATaskQueueEntry =
+            serde_json::from_value(serde_json::to_value(&in_flight).unwrap()).unwrap();
+        assert_eq!(
+            round_trip, in_flight,
+            "in-flight entry must full-round-trip through serde",
+        );
+    }
+
+    #[test]
+    fn a2a_duplicate_safety_serde_pins_snake_case_wire_form() {
+        // A2ADuplicateSafety is the auto-retry policy gate — the
+        // scheduler skips any task whose duplicate_safety is not
+        // Idempotent (auto_retry_rejects_unsafe_or_exhausted_tasks).
+        // Without rename_all the slugs would emit titlecase and the
+        // receiver-side idempotency cache would deserialize-fail on
+        // every persisted record after a daemon restart.
+        let cases: [(A2ADuplicateSafety, &str); 2] = [
+            (A2ADuplicateSafety::Unsafe, "unsafe"),
+            (A2ADuplicateSafety::Idempotent, "idempotent"),
+        ];
+        for (variant, slug) in cases {
+            let wire = serde_json::to_string(&variant).unwrap();
+            assert_eq!(wire, format!("\"{slug}\""));
+            let back: A2ADuplicateSafety = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, variant);
+        }
+
+        assert!(
+            serde_json::from_str::<A2ADuplicateSafety>("\"Unsafe\"").is_err(),
+            "titlecase Unsafe (the rename_all default) must be rejected",
+        );
+        assert!(
+            serde_json::from_str::<A2ADuplicateSafety>("\"UNSAFE\"").is_err(),
+            "uppercase UNSAFE must be rejected so the snake_case whitelist stays tight",
+        );
+    }
+
+    #[test]
+    fn a2a_idempotency_serde_pins_two_required_fields() {
+        // A2AIdempotency is the per-task duplicate-safety envelope
+        // embedded in A2ATask.idempotency (Option<A2AIdempotency>). Two
+        // required fields with no serde attributes: duplicate_safety
+        // (A2ADuplicateSafety, cross-bound to the snake_case enum pin)
+        // and key (String, the value the receiver hashes into
+        // A2AIdempotencyCacheKey.key). A rename of either field, or a
+        // skip_serializing_if = String::is_empty on key, silently
+        // bisects duplicate-safe sends across two shapes on daemon
+        // reopen and re-runs side-effectful task bodies.
+        let idemp = A2AIdempotency::new(A2ADuplicateSafety::Idempotent, "k");
+
+        let wire = serde_json::to_value(&idemp).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("A2AIdempotency serialises as a JSON object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["duplicate_safety", "key"].into_iter().collect();
+        assert_eq!(
+            keys, expected,
+            "A2AIdempotency wire form must be exactly two keys; a \
+             skip_serializing_if on either field would silently shift \
+             the envelope and break duplicate-safe receiver-side cache \
+             lookups",
+        );
+        // Cross-bind to a2a_duplicate_safety_serde_pins_snake_case_wire_form.
+        assert_eq!(
+            obj.get("duplicate_safety"),
+            Some(&serde_json::json!("idempotent")),
+        );
+
+        // Round-trip pins the PartialEq + Eq derive contract.
+        let back: A2AIdempotency = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back, idemp);
+
+        // Each strictly-required field must reject when omitted.
+        for required in ["duplicate_safety", "key"] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<A2AIdempotency>(serde_json::Value::Object(missing))
+                    .is_err(),
+                "A2AIdempotency wire form must reject a payload missing {required:?}",
+            );
+        }
+
+        // Empty key must still surface on the wire — pinning that
+        // String::is_empty is NOT skipped. An operator who supplies an
+        // empty key needs the audit row to surface that, not silently
+        // drop the column. The receiver's duplicate-safe lookup will
+        // refuse the cached short-circuit for an empty key (see
+        // evaluate_auto_retry's MissingIdempotency arm), but the
+        // request envelope still has to carry it for the audit.
+        let empty = A2AIdempotency::new(A2ADuplicateSafety::Idempotent, "");
+        let empty_wire = serde_json::to_value(&empty).unwrap();
+        let empty_obj = empty_wire.as_object().unwrap();
+        assert!(
+            empty_obj.contains_key("key"),
+            "empty key must remain present on the wire — a \
+             skip_serializing_if = String::is_empty would silently \
+             drop the audit column for the malformed-request path",
+        );
+        assert_eq!(empty_obj.get("key").unwrap(), &serde_json::json!(""));
+    }
+
+    #[test]
+    fn task_skips_optional_fields_when_none() {
+        let t = dummy_task();
+        let s = serde_json::to_string(&t).unwrap();
+        assert!(!s.contains("parent"));
+        assert!(!s.contains("deadline_ms"));
+        assert!(!s.contains("idempotency"));
+    }
+
+    #[test]
+    fn a2a_task_serde_pins_four_required_and_four_option_skip_empty() {
+        // A2ATask is the request envelope every A2A send/recv flow
+        // consumes. Eight fields: four strictly required (id, sender,
+        // recipient, intent_text) and four Option carrying
+        // #[serde(default, skip_serializing_if = "Option::is_none")] —
+        // task_kind, parent, deadline_ms, idempotency. The sibling
+        // task_skips_optional_fields_when_none test uses loose
+        // !s.contains() substring assertions; a refactor that flattens
+        // an Option (lifting inner keys to the envelope) or renames
+        // intent_text would silently bypass those substring checks.
+        // Pin the exact key set on both no-options (4-key) and
+        // all-options (8-key) paths, the required-field reject loop,
+        // and cross-bind to a2a_idempotency_serde_pins_two_required_fields
+        // by asserting idempotency surfaces as a nested {duplicate_safety,
+        // key} object.
+        let none = dummy_task();
+        let none_wire = serde_json::to_value(&none).unwrap();
+        let none_obj = none_wire
+            .as_object()
+            .expect("A2ATask serialises as a JSON object");
+        let none_keys: std::collections::BTreeSet<&str> =
+            none_obj.keys().map(String::as_str).collect();
+        let four: std::collections::BTreeSet<&str> = ["id", "sender", "recipient", "intent_text"]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            none_keys, four,
+            "no-options A2ATask wire form must be exactly four keys; \
+             dropping skip_serializing_if from any Option would inflate \
+             the wire form with explicit nulls and break consumers that \
+             filter on key presence to count populated metadata",
+        );
+
+        let mut some = dummy_task();
+        some.task_kind = Some("research".into());
+        some.parent = Some(Uuid::new_v4());
+        some.deadline_ms = Some(60_000);
+        some.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "research:agent-memory",
+        ));
+        let some_wire = serde_json::to_value(&some).unwrap();
+        let some_obj = some_wire.as_object().unwrap();
+        let some_keys: std::collections::BTreeSet<&str> =
+            some_obj.keys().map(String::as_str).collect();
+        let eight: std::collections::BTreeSet<&str> = [
+            "id",
+            "sender",
+            "recipient",
+            "intent_text",
+            "task_kind",
+            "parent",
+            "deadline_ms",
+            "idempotency",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            some_keys, eight,
+            "all-options A2ATask wire form must be exactly eight keys",
+        );
+
+        // Cross-bind to a2a_idempotency_serde_pins_two_required_fields:
+        // idempotency must serialise as a nested JSON object carrying
+        // the inner {duplicate_safety, key} contract — NOT flattened
+        // into the envelope, which would lift inner keys and silently
+        // collide with future top-level metadata.
+        let idemp_obj = some_obj
+            .get("idempotency")
+            .and_then(serde_json::Value::as_object)
+            .expect("idempotency must serialise as a nested JSON object");
+        let idemp_keys: std::collections::BTreeSet<&str> =
+            idemp_obj.keys().map(String::as_str).collect();
+        let idemp_expected: std::collections::BTreeSet<&str> =
+            ["duplicate_safety", "key"].into_iter().collect();
+        assert_eq!(
+            idemp_keys, idemp_expected,
+            "idempotency must carry the inner {{duplicate_safety, key}} shape \
+             — pinned by a2a_idempotency_serde_pins_two_required_fields",
+        );
+        for inner in ["duplicate_safety", "key"] {
+            assert!(
+                !some_obj.contains_key(inner),
+                "envelope must not expose inner idempotency key {inner:?} at \
+                 the top level — that would mean idempotency was flattened",
+            );
+        }
+
+        // Round-trip pins the PartialEq + Eq derive contract on both paths.
+        let back_none: A2ATask = serde_json::from_value(none_wire.clone()).unwrap();
+        assert_eq!(back_none, none);
+        let back_some: A2ATask = serde_json::from_value(some_wire.clone()).unwrap();
+        assert_eq!(back_some, some);
+
+        // Each strictly-required field must reject when omitted.
+        for required in ["id", "sender", "recipient", "intent_text"] {
+            let mut missing = none_obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<A2ATask>(serde_json::Value::Object(missing)).is_err(),
+                "A2ATask wire form must reject a payload missing {required:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn idempotency_cache_key_pins_safety_kind_fallback_and_empty_key_paths() {
+        let base = dummy_task();
+        let sender_b58 = base.sender.pubkey_base58();
+        let recipient_b58 = base.recipient.pubkey_base58();
+
+        // No idempotency metadata → not cacheable.
+        assert!(idempotency_cache_key(&base).is_none());
+
+        // duplicate_safety=Unsafe → not cacheable even when a key is set.
+        let mut unsafe_task = base.clone();
+        unsafe_task.idempotency = Some(A2AIdempotency::new(A2ADuplicateSafety::Unsafe, "k"));
+        assert!(idempotency_cache_key(&unsafe_task).is_none());
+
+        // Empty key → not cacheable (a single empty key would otherwise
+        // collapse every Idempotent task into one cache slot).
+        let mut empty_key = base.clone();
+        empty_key.idempotency = Some(A2AIdempotency::new(A2ADuplicateSafety::Idempotent, ""));
+        assert!(idempotency_cache_key(&empty_key).is_none());
+
+        // Whitespace-only key → not cacheable; trim must happen before
+        // the emptiness check, not after.
+        let mut blank_key = base.clone();
+        blank_key.idempotency = Some(A2AIdempotency::new(A2ADuplicateSafety::Idempotent, "   "));
+        assert!(idempotency_cache_key(&blank_key).is_none());
+
+        // task_kind=Some(non-empty) → cache key uses the explicit kind
+        // and the trimmed key value; sender/recipient base58 are bound.
+        let mut with_kind = base.clone();
+        with_kind.task_kind = Some("research.lookup".into());
+        with_kind.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "  research:agent-memory:2026-05-12  ",
+        ));
+        let key = idempotency_cache_key(&with_kind).expect("kind+key must cache");
+        assert_eq!(key.task_kind, "research.lookup");
+        assert_eq!(key.key, "research:agent-memory:2026-05-12");
+        assert_eq!(key.sender_pubkey_b58, sender_b58);
+        assert_eq!(key.recipient_pubkey_b58, recipient_b58);
+
+        // task_kind=None → fall back to intent_text so legacy senders
+        // that did not learn the explicit kind metadata still share a
+        // cache bucket per intent.
+        let mut no_kind = base.clone();
+        no_kind.idempotency = Some(A2AIdempotency::new(A2ADuplicateSafety::Idempotent, "k"));
+        let key = idempotency_cache_key(&no_kind).expect("intent fallback must cache");
+        assert_eq!(key.task_kind, base.intent_text);
+
+        // task_kind=Some(whitespace) → also fall back to intent_text;
+        // an all-whitespace kind is treated as missing so it cannot
+        // silently shard the cache off from the intent_text bucket.
+        let mut blank_kind = base.clone();
+        blank_kind.task_kind = Some("   ".into());
+        blank_kind.idempotency = Some(A2AIdempotency::new(A2ADuplicateSafety::Idempotent, "k"));
+        let key = idempotency_cache_key(&blank_kind).expect("whitespace kind must fall back");
+        assert_eq!(key.task_kind, base.intent_text);
+    }
+
+    #[test]
+    fn a2a_idempotency_cached_result_serde_pins_four_field_wire_form() {
+        // A2AIdempotencyCachedResult is the receiver-side cache value
+        // for duplicate-safe A2A sends; it pairs with the already-pinned
+        // A2AIdempotencyCacheKey. The struct rides JSON both in the
+        // in-memory result_cache HashMap and in the persisted
+        // result_cache field of the receiver's PersistentA2AState — so
+        // a daemon restart re-decodes whatever shape was last written.
+        // Four fields: source_task_id (Uuid, required), status
+        // (A2ATaskStatus, required), content (Vec<Content>,
+        // #[serde(default)] so historic rows decode), error_message
+        // (Option<String>, #[serde(default, skip_serializing_if =
+        // "Option::is_none")]). Pin all three load-bearing arms.
+        let none_value = A2AIdempotencyCachedResult {
+            source_task_id: Uuid::nil(),
+            status: A2ATaskStatus::Ok,
+            content: vec![],
+            error_message: None,
+        };
+
+        let none_wire = serde_json::to_value(&none_value).unwrap();
+        let none_obj = none_wire
+            .as_object()
+            .expect("A2AIdempotencyCachedResult serialises as a JSON object");
+        let none_keys: std::collections::BTreeSet<&str> =
+            none_obj.keys().map(String::as_str).collect();
+        let three: std::collections::BTreeSet<&str> = ["source_task_id", "status", "content"]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            none_keys, three,
+            "A2AIdempotencyCachedResult with error_message=None must be \
+             exactly three keys: error_message is skip_serializing_if = \
+             Option::is_none and content always surfaces even when empty",
+        );
+        assert_eq!(
+            none_obj.get("content"),
+            Some(&serde_json::json!([])),
+            "content must surface as an empty array even when empty — \
+             a skip_serializing_if = Vec::is_empty refactor would silently \
+             drop the key and split downstream consumers that grep on key \
+             presence",
+        );
+        // Cross-bind to a2a_task_status_serde_pins_snake_case_wire_form.
+        assert_eq!(none_obj.get("status"), Some(&serde_json::json!("ok")));
+
+        let some_value = A2AIdempotencyCachedResult {
+            source_task_id: Uuid::nil(),
+            status: A2ATaskStatus::Error,
+            content: vec![],
+            error_message: Some("boom".into()),
+        };
+        let some_wire = serde_json::to_value(&some_value).unwrap();
+        let some_obj = some_wire.as_object().unwrap();
+        let some_keys: std::collections::BTreeSet<&str> =
+            some_obj.keys().map(String::as_str).collect();
+        let four: std::collections::BTreeSet<&str> =
+            ["source_task_id", "status", "content", "error_message"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            some_keys, four,
+            "A2AIdempotencyCachedResult with error_message=Some must \
+             surface error_message on the wire",
+        );
+        assert_eq!(some_obj.get("status"), Some(&serde_json::json!("error")));
+
+        // Round-trip pins the PartialEq derive contract on both paths.
+        let back_none: A2AIdempotencyCachedResult =
+            serde_json::from_value(none_wire.clone()).unwrap();
+        assert_eq!(back_none, none_value);
+        let back_some: A2AIdempotencyCachedResult = serde_json::from_value(some_wire).unwrap();
+        assert_eq!(back_some, some_value);
+
+        // Both strictly-required fields must reject when omitted. The
+        // optional content + error_message paths are exercised below.
+        for required in ["source_task_id", "status"] {
+            let mut missing = none_obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<A2AIdempotencyCachedResult>(serde_json::Value::Object(
+                    missing
+                ))
+                .is_err(),
+                "A2AIdempotencyCachedResult wire form must reject a payload missing {required:?}",
+            );
+        }
+
+        // #[serde(default)] on content: a historic row that omits the
+        // field must still decode and yield an empty Vec. Removing the
+        // attribute would refuse every such row on daemon restart and
+        // take the receiver-side cache out at once.
+        let omitted_content: A2AIdempotencyCachedResult =
+            serde_json::from_value(serde_json::json!({
+                "source_task_id": Uuid::nil(),
+                "status": "ok",
+            }))
+            .unwrap();
+        assert_eq!(omitted_content.content, vec![]);
+        assert_eq!(omitted_content.error_message, None);
+    }
+
+    #[test]
+    fn idempotency_cached_result_from_and_to_result_pins_task_id_asymmetric_binding() {
+        // A2AIdempotencyCachedResult::from_result and ::to_result are
+        // the bidirectional bridge between
+        // an A2ATaskResult and the receiver-side idempotency cache
+        // value. The load-bearing contract is asymmetric on task_id:
+        //
+        //   from_result(&result) → records result.task_id as the cache
+        //                          value's source_task_id (preserving
+        //                          the ORIGINAL task's identifier).
+        //   to_result(task_id)   → takes a NEW task_id parameter and
+        //                          binds it to the rebuilt
+        //                          A2ATaskResult.task_id, replacing the
+        //                          cached source_task_id.
+        //
+        // Every other field — status, content, error_message — must
+        // round-trip verbatim through both directions. The
+        // a2a_idempotency_cached_result_serde_pins_four_field_wire_form
+        // covers the serialized shape; the
+        // idempotency_cache_key_pins_safety_kind_fallback_and_empty_key_paths
+        // pin covers the lookup keying. Neither pin covers
+        // the from_result/to_result transformation directly.
+        //
+        // A regression in from_result that swapped argument order during
+        // a fan-out cleanup (e.g., consolidating cache-write with
+        // wire-write code paths) would silently write the receiver's
+        // processing task_id into source_task_id instead of the
+        // original's — audit dashboards correlate by source_task_id and
+        // every replay would surface against the wrong task. A
+        // regression in to_result that returned source_task_id directly
+        // (e.g., a 'simplify' pass that thinks the task_id parameter is
+        // redundant) would silently replay every cached result against
+        // the ORIGINAL task_id — CLI consumers grepping on task_id
+        // could never locate the replayed row.
+        let original_id = Uuid::from_u128(7);
+        let replay_id = Uuid::from_u128(99);
+        assert_ne!(
+            original_id, replay_id,
+            "test fixture: replay id must differ from original so the \
+             rebind arm is observable",
+        );
+
+        // Ok variant: from_result preserves task_id as source_task_id;
+        // status/content round-trip; error_message stays None.
+        let ok_original = A2ATaskResult::ok(original_id, vec![Content::text("cached")]);
+        let cached_ok = A2AIdempotencyCachedResult::from_result(&ok_original);
+        assert_eq!(
+            cached_ok.source_task_id, original_id,
+            "from_result must record result.task_id as source_task_id \
+             — a refactor that swapped argument order during a fan-out \
+             cleanup would silently write the receiver's processing \
+             task_id into source_task_id and break audit-dashboard \
+             correlation by source_task_id for every replayed result",
+        );
+        assert_eq!(
+            cached_ok.status,
+            A2ATaskStatus::Ok,
+            "from_result must preserve A2ATaskResult.status verbatim — \
+             a refactor that defaulted to A2ATaskStatus::Error on the \
+             cache-write path would silently mislabel every cached ok \
+             result as an error on replay",
+        );
+        assert_eq!(
+            cached_ok.content, ok_original.content,
+            "from_result must clone A2ATaskResult.content verbatim — a \
+             refactor that dropped content on the cache-write path \
+             would silently strip every cached result of its tool/agent \
+             output on replay",
+        );
+        assert_eq!(
+            cached_ok.error_message, None,
+            "from_result on an ok result must preserve error_message \
+             == None — a refactor that defaulted to Some(String::new()) \
+             would silently surface every cached ok result with an \
+             empty-string error breadcrumb on replay",
+        );
+
+        let replayed_ok = cached_ok.to_result(replay_id);
+        assert_eq!(
+            replayed_ok.task_id, replay_id,
+            "to_result must bind the new task_id parameter to \
+             A2ATaskResult.task_id, NOT source_task_id — a 'simplify' \
+             pass that thought the task_id parameter was redundant and \
+             returned cached.source_task_id directly would silently \
+             replay every cached result against the ORIGINAL task_id; \
+             CLI consumers and the HTTP gateway grep on task_id and \
+             would never locate the replayed row — the idempotency \
+             cache would become a write-only mailbox from the consumer \
+             side",
+        );
+        assert_ne!(
+            replayed_ok.task_id, cached_ok.source_task_id,
+            "to_result must NOT preserve source_task_id on the rebuilt \
+             A2ATaskResult — the rebind is asymmetric: from_result \
+             stores the original, to_result substitutes the replay id",
+        );
+        assert_eq!(
+            replayed_ok.status, cached_ok.status,
+            "to_result must surface cached.status verbatim",
+        );
+        assert_eq!(
+            replayed_ok.content, cached_ok.content,
+            "to_result must surface cached.content verbatim",
+        );
+        assert_eq!(
+            replayed_ok.error_message, cached_ok.error_message,
+            "to_result must surface cached.error_message verbatim",
+        );
+
+        // Error variant: error_message must round-trip on both sides;
+        // A2ATaskResult::error wipes content to Vec::new(), so the
+        // cached.content stays empty and the replayed.content stays
+        // empty even though to_result is given a different task_id.
+        let err_original = A2ATaskResult::error(original_id, "boom");
+        let cached_err = A2AIdempotencyCachedResult::from_result(&err_original);
+        assert_eq!(
+            cached_err.source_task_id, original_id,
+            "from_result on the error path must preserve source_task_id \
+             identically to the ok path — the asymmetric rebind contract \
+             is independent of A2ATaskStatus",
+        );
+        assert_eq!(cached_err.status, A2ATaskStatus::Error);
+        assert_eq!(
+            cached_err.error_message.as_deref(),
+            Some("boom"),
+            "from_result must preserve A2ATaskResult.error_message \
+             verbatim — a refactor that flattened error_message onto a \
+             single combined 'message' field would silently drop the \
+             distinction between status=Ok and status=Error on every \
+             cached row",
+        );
+
+        let replayed_err = cached_err.to_result(replay_id);
+        assert_eq!(
+            replayed_err.task_id, replay_id,
+            "to_result on the error path must rebind task_id identically \
+             to the ok path",
+        );
+        assert_eq!(replayed_err.status, A2ATaskStatus::Error);
+        assert_eq!(
+            replayed_err.error_message.as_deref(),
+            Some("boom"),
+            "to_result must surface cached.error_message verbatim on \
+             the error path — a regression that dropped error_message \
+             from the rebuild step would silently replay every cached \
+             error as an empty-message error",
+        );
+        assert!(
+            replayed_err.content.is_empty(),
+            "A2ATaskResult::error wipes content to Vec::new() at the \
+             constructor; from_result clones that empty content into \
+             cached.content; to_result clones cached.content back into \
+             the rebuilt result — the empty-content invariant must \
+             survive the full round-trip",
+        );
+    }
+
+    #[test]
+    fn a2a_idempotency_cache_key_serde_pins_four_required_fields() {
+        // A2AIdempotencyCacheKey is the receiver-side cache key for
+        // duplicate-safe A2A sends — the keyed struct A2AIdempotencyCachedResult
+        // maps from. Four strictly required fields with no serde
+        // attributes: sender_pubkey_b58, recipient_pubkey_b58, task_kind,
+        // key. The struct derives Hash so it's also the HashMap key for
+        // the in-memory idempotency cache. A skip_serializing_if =
+        // String::is_empty on task_kind would silently drop the field
+        // for the empty-task_kind path (where idempotency_cache_key's
+        // fallback fills task_kind with intent_text), and a rename of
+        // sender_pubkey_b58 or recipient_pubkey_b58 would silently lose
+        // pair-scope on cache lookups across daemon restarts.
+        let key = A2AIdempotencyCacheKey {
+            sender_pubkey_b58: "S".into(),
+            recipient_pubkey_b58: "R".into(),
+            task_kind: "research".into(),
+            key: "abc".into(),
+        };
+
+        let wire = serde_json::to_value(&key).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("A2AIdempotencyCacheKey serialises as a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "key",
+                "recipient_pubkey_b58",
+                "sender_pubkey_b58",
+                "task_kind"
+            ],
+            "A2AIdempotencyCacheKey wire object must contain exactly four \
+             documented fields; a skip_serializing_if would silently shift \
+             the cache key shape and split cache lookups across two forms \
+             on daemon restart",
+        );
+
+        // Round-trip pins the PartialEq + Eq derive contract.
+        let back: A2AIdempotencyCacheKey = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back, key);
+
+        // Each strictly-required field must reject when omitted.
+        for required in [
+            "sender_pubkey_b58",
+            "recipient_pubkey_b58",
+            "task_kind",
+            "key",
+        ] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<A2AIdempotencyCacheKey>(serde_json::Value::Object(
+                    missing,
+                ))
+                .is_err(),
+                "A2AIdempotencyCacheKey wire form must reject a payload missing {required:?}",
+            );
+        }
+
+        // Hash derive identity: two keys with the same field values must
+        // hash and compare identically, so the in-memory cache HashMap
+        // resolves a lookup against a freshly-built key. A refactor that
+        // dropped Hash from the derive or changed its impl would silently
+        // re-process every duplicate task on cache miss.
+        let mut cache: std::collections::HashMap<A2AIdempotencyCacheKey, u32> =
+            std::collections::HashMap::new();
+        cache.insert(key.clone(), 7);
+        let probe = A2AIdempotencyCacheKey {
+            sender_pubkey_b58: "S".into(),
+            recipient_pubkey_b58: "R".into(),
+            task_kind: "research".into(),
+            key: "abc".into(),
+        };
+        assert_eq!(cache.get(&probe), Some(&7));
+    }
+
+    #[test]
+    fn a2a_auto_retry_skipped_serde_pins_three_required_and_lease_age_skip_empty() {
+        // A2AAutoRetrySkipped is the per-task row in
+        // A2AAutoRetryReport.skipped, written into the
+        // A2AAutoRetrySchedulerScan audit envelope's skipped_by_reason
+        // counters and surfaced through the operator triage CLI/HTTP
+        // path. Three required fields: task_id, reason, attempt; one
+        // optional: lease_age_ms with #[serde(default,
+        // skip_serializing_if = "Option::is_none")] so the
+        // OperatorDisabled and NotInFlight branches (which fire before
+        // a lease is read) stay compact on disk.
+        let task_id = Uuid::nil();
+
+        // None path: three keys, lease_age_ms must be dropped. The
+        // Disabled and NotInFlight branches fire before the entry's
+        // lease is read, so lease_age_ms = None is the realistic shape
+        // for those audit rows.
+        let none = A2AAutoRetrySkipped {
+            task_id,
+            reason: A2AAutoRetrySkipReason::Disabled,
+            attempt: 0,
+            lease_age_ms: None,
+        };
+        let none_wire = serde_json::to_value(&none).unwrap();
+        let none_obj = none_wire
+            .as_object()
+            .expect("A2AAutoRetrySkipped serialises as a JSON object");
+        let none_keys: std::collections::BTreeSet<&str> =
+            none_obj.keys().map(String::as_str).collect();
+        let three_keys: std::collections::BTreeSet<&str> =
+            ["task_id", "reason", "attempt"].into_iter().collect();
+        assert_eq!(
+            none_keys, three_keys,
+            "A2AAutoRetrySkipped with lease_age_ms=None must emit exactly \
+             three keys; dropping skip_serializing_if would silently \
+             double the bytes per Disabled audit row by emitting \
+             \"lease_age_ms\":null",
+        );
+
+        // Some path: four keys, lease_age_ms surfaces verbatim.
+        let some = A2AAutoRetrySkipped {
+            task_id,
+            reason: A2AAutoRetrySkipReason::LeaseTooYoung,
+            attempt: 1,
+            lease_age_ms: Some(60_000),
+        };
+        let some_wire = serde_json::to_value(&some).unwrap();
+        let some_keys: std::collections::BTreeSet<&str> = some_wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let four_keys: std::collections::BTreeSet<&str> =
+            ["task_id", "reason", "attempt", "lease_age_ms"]
+                .into_iter()
+                .collect();
+        assert_eq!(some_keys, four_keys);
+        assert_eq!(
+            some_wire.get("lease_age_ms").unwrap(),
+            &serde_json::json!(60_000),
+        );
+
+        // Each strictly-required field must reject when omitted.
+        for required in ["task_id", "reason", "attempt"] {
+            let mut missing = none_obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<A2AAutoRetrySkipped>(serde_json::Value::Object(missing))
+                    .is_err(),
+                "A2AAutoRetrySkipped wire form must reject a payload missing {required:?}",
+            );
+        }
+
+        // Omitting lease_age_ms must decode to None — the #[serde(default)]
+        // forward-compat path for any audit row that pre-dates the field.
+        let mut without_age = some_wire.as_object().unwrap().clone();
+        without_age.remove("lease_age_ms");
+        let legacy: A2AAutoRetrySkipped =
+            serde_json::from_value(serde_json::Value::Object(without_age)).unwrap();
+        assert!(legacy.lease_age_ms.is_none());
+
+        // Round-trips on both paths.
+        let back_none: A2AAutoRetrySkipped = serde_json::from_value(none_wire.clone()).unwrap();
+        assert_eq!(back_none, none);
+        let back_some: A2AAutoRetrySkipped = serde_json::from_value(some_wire.clone()).unwrap();
+        assert_eq!(back_some, some);
+
+        // Cross-binding: reason on Disabled serialises to "disabled"
+        // (a2a_auto_retry_skip_reason_serde_pins_each_snake_case_slug).
+        assert_eq!(
+            none_wire.get("reason").unwrap(),
+            &serde_json::json!("disabled"),
+        );
+    }
+
+    #[test]
+    fn a2a_auto_retry_requeued_serde_pins_four_required_fields() {
+        // A2AAutoRetryRequeued is the per-task row in
+        // A2AAutoRetryReport.requeued — the scheduler's success record
+        // for every queued entry the auto-retry policy actually
+        // requeued. Four strictly required fields with no serde
+        // attributes: task_id, lease_id, attempt, idempotency_key. The
+        // empty-string idempotency_key path is realistic — the
+        // intent_text fallback can produce a non-empty key for an
+        // empty task_kind, but a bug that collapses the key must
+        // surface on the audit row, not hide.
+        let requeued = A2AAutoRetryRequeued {
+            task_id: Uuid::nil(),
+            lease_id: Uuid::new_v4(),
+            attempt: 2,
+            idempotency_key: "k".into(),
+        };
+
+        let wire = serde_json::to_value(&requeued).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("A2AAutoRetryRequeued serialises as a JSON object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["task_id", "lease_id", "attempt", "idempotency_key"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            keys, expected,
+            "A2AAutoRetryRequeued wire form must be exactly four keys; a \
+             skip_serializing_if on any field would silently shift the \
+             scheduler audit row and break operator triage queries that \
+             grep on key presence",
+        );
+
+        // Round-trip pins the PartialEq + Eq derive contract.
+        let back: A2AAutoRetryRequeued = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back, requeued);
+
+        // Each strictly-required field must reject when omitted.
+        for required in ["task_id", "lease_id", "attempt", "idempotency_key"] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<A2AAutoRetryRequeued>(serde_json::Value::Object(missing))
+                    .is_err(),
+                "A2AAutoRetryRequeued wire form must reject a payload missing {required:?}",
+            );
+        }
+
+        // Empty idempotency_key must still surface on the wire — pinning
+        // that String::is_empty is NOT skipped. A bug that collapsed the
+        // key to empty needs to leave a trail on the audit row, not
+        // silently drop the column.
+        let empty_key = A2AAutoRetryRequeued {
+            task_id: Uuid::nil(),
+            lease_id: Uuid::new_v4(),
+            attempt: 0,
+            idempotency_key: String::new(),
+        };
+        let empty_wire = serde_json::to_value(&empty_key).unwrap();
+        let empty_obj = empty_wire.as_object().unwrap();
+        assert!(
+            empty_obj.contains_key("idempotency_key"),
+            "empty idempotency_key must remain present on the wire — a \
+             skip_serializing_if = String::is_empty would silently hide \
+             the bug surface the audit row exists to preserve",
+        );
+        assert_eq!(
+            empty_obj.get("idempotency_key").unwrap(),
+            &serde_json::json!(""),
+        );
+    }
+
+    #[test]
+    fn a2a_auto_retry_report_serde_pins_four_field_wire_form() {
+        // A2AAutoRetryReport is the top-level scheduler-scan return
+        // envelope. Four fields: policy (A2AAutoRetryPolicy, the
+        // configuration snapshot), considered (usize), requeued
+        // (Vec<A2AAutoRetryRequeued>, #[serde(default)]), skipped
+        // (Vec<A2AAutoRetrySkipped>, #[serde(default)]). The Vec
+        // defaults are decode-side only — no skip_serializing_if — so
+        // an idle scan (the common case) still emits requeued=[] and
+        // skipped=[] verbatim. A refactor that added
+        // skip_serializing_if = Vec::is_empty would collapse zero-action
+        // rows and split downstream consumers that filter on key
+        // presence.
+        let report = A2AAutoRetryReport::new(A2AAutoRetryPolicy::default());
+
+        let wire = serde_json::to_value(&report).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("A2AAutoRetryReport serialises as a JSON object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["policy", "considered", "requeued", "skipped"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            keys, expected,
+            "A2AAutoRetryReport wire form must be exactly four keys with \
+             empty requeued=[] and skipped=[] still present; a \
+             skip_serializing_if = Vec::is_empty would drop those keys \
+             on idle scans and break audit dashboards that filter on \
+             key presence",
+        );
+        assert_eq!(
+            obj.get("requeued"),
+            Some(&serde_json::json!([])),
+            "empty requeued must surface as [] on the wire",
+        );
+        assert_eq!(
+            obj.get("skipped"),
+            Some(&serde_json::json!([])),
+            "empty skipped must surface as [] on the wire",
+        );
+        // considered must be a JSON number, not a stringified usize —
+        // a Serialize override that emitted a string would silently
+        // break every consumer that does arithmetic on the field.
+        assert!(
+            obj.get("considered").and_then(serde_json::Value::as_u64) == Some(0),
+            "considered must serialise as a JSON number, not a string",
+        );
+
+        // Round-trip pins the PartialEq + Eq derive contract.
+        let back: A2AAutoRetryReport = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back, report);
+
+        // Each strictly-required field must reject when omitted.
+        for required in ["policy", "considered"] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<A2AAutoRetryReport>(serde_json::Value::Object(missing))
+                    .is_err(),
+                "A2AAutoRetryReport wire form must reject a payload missing {required:?}",
+            );
+        }
+
+        // #[serde(default)] on requeued and skipped: a historic row
+        // that omits either field must still decode and yield an empty
+        // Vec. Dropping the default would refuse a manually-built
+        // partial payload and break the scheduler-scan replay path.
+        let omitted: A2AAutoRetryReport = serde_json::from_value(serde_json::json!({
+            "policy": A2AAutoRetryPolicy::default(),
+            "considered": 0,
+        }))
+        .unwrap();
+        assert!(omitted.requeued.is_empty());
+        assert!(omitted.skipped.is_empty());
+    }
+
+    #[test]
+    fn mailbox_event_task_recv_serde_pins_two_key_variant() {
+        // MailboxEvent::TaskRecv is the dequeue tombstone the daemon
+        // appends to the JSONL mailbox log after recv_task pops a task
+        // off the queue. With #[serde(tag = "type", rename_all =
+        // "snake_case")] on the enum, the wire object is exactly two
+        // keys: type='task_recv' plus task_id (Uuid). The MailboxEvent
+        // enum is the entire append-only event log
+        // JsonlMailbox::open replays on daemon restart to rebuild the
+        // in-memory queue, in-flight leases, senders map, and
+        // idempotency cache; none of its nine variants have explicit
+        // wire-form pins. Without this pin a refactor that flips the
+        // discriminator slug, renames task_id, or adds #[serde(default)]
+        // to task_id would silently strand every prior JSONL TaskRecv
+        // row at replay — the queue would rebuild with the task still
+        // appearing queued (the original TaskSent row survives but its
+        // dequeue tombstone is invisible) and the next recv_task call
+        // would double-receive a task that was already delivered
+        // upstream of the restart.
+        let event = MailboxEvent::TaskRecv {
+            task_id: Uuid::from_u128(7),
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("MailboxEvent serialises as a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["task_id", "type"],
+            "MailboxEvent::TaskRecv wire form must be exactly two keys: \
+             the single variant field plus the 'type' discriminator. A \
+             refactor that renamed task_id without #[serde(rename = ...)] \
+             would silently fail decode on every prior JSONL TaskRecv row, \
+             the mailbox would rebuild with the task appearing still \
+             queued, and the next recv_task call would double-receive a \
+             task that was already delivered upstream of the restart",
+        );
+        assert_eq!(
+            obj.get("type"),
+            Some(&serde_json::json!("task_recv")),
+            "MailboxEvent discriminator slug must be snake_case 'task_recv'; \
+             a refactor that removed rename_all = \"snake_case\" or that \
+             renamed the variant to a different shape silently strands \
+             every prior JSONL TaskRecv tombstone at replay and turns a \
+             single dequeue into a duplicate-delivery bug across daemon \
+             restart",
+        );
+        assert_eq!(
+            obj.get("task_id").and_then(serde_json::Value::as_str),
+            Some(Uuid::from_u128(7).to_string().as_str()),
+            "MailboxEvent::TaskRecv::task_id must surface as the Uuid's \
+             hyphenated string form; any representation shift breaks the \
+             cross-event join replay uses to match TaskRecv tombstones \
+             against TaskSent entries by id",
+        );
+
+        let back: MailboxEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            back, event,
+            "MailboxEvent::TaskRecv must round-trip through serde_json \
+             verbatim — the PartialEq derive is the contract the \
+             JsonlMailbox::open replay path joins mailbox events against",
+        );
+
+        let mut missing = obj.clone();
+        missing.remove("task_id");
+        assert!(
+            serde_json::from_value::<MailboxEvent>(serde_json::Value::Object(missing)).is_err(),
+            "MailboxEvent::TaskRecv wire form must reject a payload missing \
+             task_id; a stray #[serde(default)] would let a malformed row \
+             decode with Uuid::nil() and replay would mark the nil task as \
+             received — the real task remains in the queue and silently \
+             double-delivers while the nil entry shadows every subsequent \
+             TaskRecv targeting the nil id",
+        );
+    }
+
+    #[test]
+    fn mailbox_event_result_recv_serde_pins_two_key_variant() {
+        // MailboxEvent::ResultRecv is the result-dequeue tombstone the
+        // daemon appends to the JSONL mailbox log after recv_result
+        // pops a task result off the result queue. With #[serde(tag =
+        // "type", rename_all = "snake_case")] on the enum, the wire
+        // object is exactly two keys: type='result_recv' plus task_id
+        // (Uuid). Sister variant TaskRecv is now pinned but ResultRecv
+        // has no enum-level wire-form pin. A refactor that flips the
+        // discriminator slug, renames task_id, or adds #[serde(default)]
+        // to task_id would silently strand every prior JSONL ResultRecv
+        // row at replay — the daemon would rebuild with the result
+        // still appearing queued (the original ResultPosted row survives
+        // but its dequeue tombstone is invisible) and the next
+        // recv_result call would double-deliver a result that was
+        // already consumed upstream of the restart.
+        let event = MailboxEvent::ResultRecv {
+            task_id: Uuid::from_u128(11),
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("MailboxEvent serialises as a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["task_id", "type"],
+            "MailboxEvent::ResultRecv wire form must be exactly two keys: \
+             the single variant field plus the 'type' discriminator. A \
+             refactor that renamed task_id without #[serde(rename = ...)] \
+             would silently fail decode on every prior JSONL ResultRecv \
+             row, the result deque would rebuild with the result still \
+             appearing queued, and the next recv_result call would \
+             double-deliver a result that was already consumed upstream \
+             of the daemon restart",
+        );
+        assert_eq!(
+            obj.get("type"),
+            Some(&serde_json::json!("result_recv")),
+            "MailboxEvent discriminator slug must be snake_case 'result_recv'; \
+             a refactor that removed rename_all = \"snake_case\" or that \
+             collapsed it onto TaskRecv's 'task_recv' slug would silently \
+             strand every prior ResultRecv tombstone at replay and turn a \
+             single result dequeue into a duplicate-delivery bug across \
+             daemon restart",
+        );
+        assert_eq!(
+            obj.get("task_id").and_then(serde_json::Value::as_str),
+            Some(Uuid::from_u128(11).to_string().as_str()),
+            "MailboxEvent::ResultRecv::task_id must surface as the Uuid's \
+             hyphenated string form; any representation shift breaks the \
+             cross-event join replay uses to match ResultRecv tombstones \
+             against ResultPosted entries by id",
+        );
+
+        let back: MailboxEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            back, event,
+            "MailboxEvent::ResultRecv must round-trip through serde_json \
+             verbatim — the PartialEq derive is the contract the \
+             JsonlMailbox::open replay path joins mailbox events against",
+        );
+
+        let mut missing = obj.clone();
+        missing.remove("task_id");
+        assert!(
+            serde_json::from_value::<MailboxEvent>(serde_json::Value::Object(missing)).is_err(),
+            "MailboxEvent::ResultRecv wire form must reject a payload \
+             missing task_id; a stray #[serde(default)] would let a \
+             malformed row decode with Uuid::nil() and replay would mark \
+             the nil result as consumed — the real result remains queued \
+             and silently double-delivers while the nil entry shadows \
+             every subsequent ResultRecv targeting the nil id",
+        );
+    }
+
+    #[test]
+    fn mailbox_event_task_sent_serde_pins_nested_task_variant() {
+        // MailboxEvent::TaskSent is the queue-head append the daemon
+        // writes to the JSONL mailbox log after send_task accepts a new
+        // task. With #[serde(tag = "type", rename_all = "snake_case")]
+        // on the enum, the wire object is exactly two top-level keys:
+        // type='task_sent' plus task (a nested A2ATask object carrying
+        // id, sender, recipient, intent_text, and four
+        // #[serde(default, skip_serializing_if)] Option fields).
+        // a2a_task_serde_pins_four_required_and_four_option_skip_empty
+        // covers the inner A2ATask payload, but no test pins the
+        // enum-level struct-variant wrapper. A refactor that promoted
+        // TaskSent from a struct variant to a newtype variant
+        // (TaskSent(A2ATask)) would flatten A2ATask's fields next to
+        // 'type' on the wire and every prior JSONL TaskSent row that
+        // nests under 'task' would silently fail decode at
+        // JsonlMailbox::open replay — every queued-but-not-leased task
+        // disappears across daemon restart, sender histories rebuild
+        // empty, and the a2a.respond.<sender> capability check loses
+        // its registry source.
+        let mut task = dummy_task();
+        task.id = Uuid::from_u128(13);
+        let event = MailboxEvent::TaskSent { task: task.clone() };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("MailboxEvent serialises as a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["task", "type"],
+            "MailboxEvent::TaskSent wire form must be exactly two \
+             top-level keys: 'type' plus the nested 'task' field. A \
+             refactor that promoted TaskSent from struct variant to \
+             newtype variant would flatten A2ATask's fields next to \
+             'type' and every prior JSONL TaskSent row that nests under \
+             'task' would silently fail decode at replay — every \
+             queued-but-not-leased task would disappear across daemon \
+             restart",
+        );
+        assert_eq!(
+            obj.get("type"),
+            Some(&serde_json::json!("task_sent")),
+            "MailboxEvent discriminator slug must be snake_case \
+             'task_sent'; a refactor that flipped the slug or removed \
+             rename_all = \"snake_case\" silently strands every prior \
+             JSONL TaskSent row at replay and the mailbox rebuilds with \
+             an empty tasks deque — senders that already enqueued tasks \
+             before the restart see their tasks disappear and the \
+             recipient never receives them",
+        );
+
+        let task_obj = obj
+            .get("task")
+            .and_then(serde_json::Value::as_object)
+            .expect("MailboxEvent::TaskSent::task must serialise as a nested JSON object");
+        for required in ["id", "sender", "recipient", "intent_text"] {
+            assert!(
+                task_obj.contains_key(required),
+                "MailboxEvent::TaskSent::task must surface the four \
+                 required A2ATask fields at the nested level; missing \
+                 {required:?} would break the cross-event join replay \
+                 uses to attribute the queued task to its sender and \
+                 recipient",
+            );
+        }
+        assert_eq!(
+            task_obj.get("id").and_then(serde_json::Value::as_str),
+            Some(Uuid::from_u128(13).to_string().as_str()),
+            "MailboxEvent::TaskSent::task.id must surface as the Uuid's \
+             hyphenated string form — replay matches TaskSent against \
+             TaskRecv/TaskLeased tombstones by this exact representation",
+        );
+
+        let back: MailboxEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            back, event,
+            "MailboxEvent::TaskSent must round-trip through serde_json \
+             verbatim — the PartialEq derive is the contract the \
+             JsonlMailbox::open replay path joins mailbox events against",
+        );
+
+        let mut missing = obj.clone();
+        missing.remove("task");
+        assert!(
+            serde_json::from_value::<MailboxEvent>(serde_json::Value::Object(missing)).is_err(),
+            "MailboxEvent::TaskSent wire form must reject a payload \
+             missing 'task'; a stray #[serde(default)] would let a \
+             malformed row decode with A2ATask::default() — a queued \
+             task with a nil id, empty sender, empty recipient, and \
+             empty intent_text — and replay would enqueue that \
+             zero-payload entry, exposing whoever is listening to a \
+             malformed dispatch with no traceable origin",
+        );
+    }
+
+    #[test]
+    fn mailbox_event_result_posted_serde_pins_nested_result_variant() {
+        // MailboxEvent::ResultPosted is the result-enqueue append the
+        // daemon writes to the JSONL mailbox log after send_result
+        // accepts a task result for delivery to the originating sender.
+        // With #[serde(tag = "type", rename_all = "snake_case")] on the
+        // enum, the wire object is exactly two top-level keys:
+        // type='result_posted' plus result (a nested A2ATaskResult
+        // object carrying task_id, status, content with
+        // #[serde(default)] empty-vec round-trip, and error_message
+        // under skip_serializing_if = Option::is_none).
+        // a2a_task_result_serde_pins_content_default_and_error_message_skip_empty
+        // covers the inner A2ATaskResult payload, but no test pins the
+        // enum-level struct-variant wrapper. A refactor that promoted
+        // ResultPosted from a struct variant to a newtype variant
+        // (ResultPosted(A2ATaskResult)) would flatten A2ATaskResult's
+        // fields next to 'type' on the wire and every prior JSONL
+        // ResultPosted row that nests under 'result' would silently
+        // fail decode at JsonlMailbox::open replay — every
+        // queued-but-not-consumed result disappears across daemon
+        // restart and the sender's recv_result loop never sees the
+        // response.
+        let result = A2ATaskResult::ok(Uuid::from_u128(19), Vec::new());
+        let event = MailboxEvent::ResultPosted {
+            result: result.clone(),
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("MailboxEvent serialises as a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["result", "type"],
+            "MailboxEvent::ResultPosted wire form must be exactly two \
+             top-level keys: 'type' plus the nested 'result' field. A \
+             refactor that promoted ResultPosted from struct variant to \
+             newtype variant would flatten A2ATaskResult's fields next \
+             to 'type' and every prior JSONL ResultPosted row that nests \
+             under 'result' would silently fail decode at replay — \
+             every queued-but-not-consumed result would disappear across \
+             daemon restart",
+        );
+        assert_eq!(
+            obj.get("type"),
+            Some(&serde_json::json!("result_posted")),
+            "MailboxEvent discriminator slug must be snake_case \
+             'result_posted'; a refactor that flipped the slug or removed \
+             rename_all = \"snake_case\" silently strands every prior \
+             JSONL ResultPosted row at replay — the sender never sees \
+             the response that was already produced upstream of the \
+             restart and recv_result blocks indefinitely",
+        );
+
+        let result_obj = obj
+            .get("result")
+            .and_then(serde_json::Value::as_object)
+            .expect("MailboxEvent::ResultPosted::result must serialise as a nested JSON object");
+        for required in ["task_id", "status", "content"] {
+            assert!(
+                result_obj.contains_key(required),
+                "MailboxEvent::ResultPosted::result must surface \
+                 {required:?} at the nested level; missing this key \
+                 would break the cross-event join replay uses to \
+                 correlate the result with its originating TaskSent / \
+                 sender",
+            );
+        }
+        assert_eq!(
+            result_obj
+                .get("task_id")
+                .and_then(serde_json::Value::as_str),
+            Some(Uuid::from_u128(19).to_string().as_str()),
+            "MailboxEvent::ResultPosted::result.task_id must surface as \
+             the Uuid's hyphenated string form — replay matches \
+             ResultPosted against TaskSent and ResultRecv by this exact \
+             representation",
+        );
+        assert_eq!(
+            result_obj.get("content"),
+            Some(&serde_json::json!([])),
+            "MailboxEvent::ResultPosted::result.content must surface as \
+             [] for an empty-content result — a refactor that added \
+             skip_serializing_if = Vec::is_empty would drop the column \
+             on the wire and break downstream consumers that destructure \
+             on key presence",
+        );
+
+        let back: MailboxEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            back, event,
+            "MailboxEvent::ResultPosted must round-trip through \
+             serde_json verbatim — the PartialEq derive is the contract \
+             the JsonlMailbox::open replay path joins mailbox events \
+             against",
+        );
+
+        let mut missing = obj.clone();
+        missing.remove("result");
+        assert!(
+            serde_json::from_value::<MailboxEvent>(serde_json::Value::Object(missing)).is_err(),
+            "MailboxEvent::ResultPosted wire form must reject a payload \
+             missing 'result'; a stray #[serde(default)] would let a \
+             malformed row decode with A2ATaskResult::default() — \
+             task_id Uuid::nil(), status default-variant, content [] — \
+             and replay would enqueue that zero-result entry, silently \
+             corrupting the sender's task-correlation logic when \
+             recv_result delivers a synthetic nil-task result that does \
+             not match any outstanding send_task",
+        );
+    }
+
+    #[test]
+    fn mailbox_event_task_leased_serde_pins_five_field_variant() {
+        // MailboxEvent::TaskLeased is the lease-issued event the daemon
+        // appends to the JSONL mailbox log when a task transitions from
+        // queued to in-flight (via try_recv_task_for). With
+        // #[serde(tag = "type", rename_all = "snake_case")] on the
+        // enum, the wire object is exactly six keys: type='task_leased'
+        // plus task_id (Uuid), lease_id (Uuid), leased_to (nested
+        // AgentId display+pubkey), leased_at_ms (u64), attempt (u32).
+        // The in-flight lease map this rebuilds at replay is what
+        // makes A2A delivery exactly-once across daemon restart — if
+        // TaskLeased wire form drifts, recovered leases lose either
+        // their owner identity (capability checks degrade) or their
+        // identity-bound lease_id (repair commands can't target the
+        // right entry). No test pins the enum-level wire form.
+        let event = MailboxEvent::TaskLeased {
+            task_id: Uuid::from_u128(21),
+            lease_id: Uuid::from_u128(22),
+            leased_to: dummy_agent("worker@local"),
+            leased_at_ms: 30_000,
+            attempt: 1,
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("MailboxEvent serialises as a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "attempt",
+                "lease_id",
+                "leased_at_ms",
+                "leased_to",
+                "task_id",
+                "type",
+            ],
+            "MailboxEvent::TaskLeased wire form must be exactly six keys: \
+             the five variant fields plus the 'type' discriminator. A \
+             refactor that renamed any of task_id, lease_id, leased_to, \
+             leased_at_ms, or attempt without #[serde(rename = ...)] \
+             would silently fail decode on every prior JSONL TaskLeased \
+             row, the in-flight map would empty at replay, and active \
+             operator repair commands targeting a leased task by \
+             lease_id would silently no-op against the orphaned entry",
+        );
+        assert_eq!(
+            obj.get("type"),
+            Some(&serde_json::json!("task_leased")),
+            "MailboxEvent discriminator slug must be snake_case \
+             'task_leased'; a slug regression silently strands every \
+             prior JSONL TaskLeased row at replay and the in-flight map \
+             rebuilds empty — every in-flight task appears reclaimable \
+             and the next try_recv_task_for caller silently re-leases an \
+             already-leased task, double-dispatching the work",
+        );
+
+        let leased_to_obj = obj
+            .get("leased_to")
+            .and_then(serde_json::Value::as_object)
+            .expect("MailboxEvent::TaskLeased::leased_to must serialise as a nested JSON object");
+        let mut leased_keys: Vec<&str> = leased_to_obj.keys().map(String::as_str).collect();
+        leased_keys.sort();
+        assert_eq!(
+            leased_keys,
+            vec!["display", "pubkey"],
+            "MailboxEvent::TaskLeased::leased_to must surface the AgentId \
+             display+pubkey shape; a refactor that flattened or \
+             restructured AgentId would break the cross-type contract \
+             between mailbox replay and capability subject resolution — \
+             leased_to would lose its display+pubkey binding and \
+             capability checks for the leased worker would silently \
+             degrade to display-only matching, exposing the lease \
+             attribution to display-collision attacks",
+        );
+        assert_eq!(
+            leased_to_obj
+                .get("display")
+                .and_then(serde_json::Value::as_str),
+            Some("worker@local"),
+        );
+
+        let back: MailboxEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            back, event,
+            "MailboxEvent::TaskLeased must round-trip through serde_json \
+             verbatim — the PartialEq derive is the contract the \
+             JsonlMailbox::open replay path joins lease events against",
+        );
+
+        for required in [
+            "task_id",
+            "lease_id",
+            "leased_to",
+            "leased_at_ms",
+            "attempt",
+        ] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<MailboxEvent>(serde_json::Value::Object(missing)).is_err(),
+                "MailboxEvent::TaskLeased wire form must reject a payload \
+                 missing {required:?}; a stray #[serde(default)] on \
+                 leased_to would let a malformed row decode with a \
+                 zero-value AgentId and replay would bind the lease to a \
+                 synthetic empty-display identity — the \
+                 a2a.respond.<sender> capability check would lose its \
+                 registry mapping for the lease and the response path \
+                 would silently drop the result when the worker posted \
+                 back to the nil sender",
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_event_task_requeued_serde_pins_six_field_variant() {
+        // MailboxEvent::TaskRequeued is the lease-release-and-requeue
+        // repair event the daemon appends to the JSONL mailbox log when
+        // an in-flight lease is requeued (operator-initiated repair or
+        // scheduler auto-retry). With #[serde(tag = "type",
+        // rename_all = "snake_case")] on the enum, the wire object is
+        // exactly seven keys: type='task_requeued' plus task_id (Uuid),
+        // lease_id (Uuid), reason (String), duplicate_risk
+        // (A2ADuplicateRisk enum: idempotent | operator_accepted),
+        // requeued_at_ms (u64), attempt (u32). The duplicate_risk
+        // field is load-bearing for replay — it pins whether the
+        // requeue tolerates a downstream duplicate-delivery race
+        // (idempotent task semantics) or whether the operator
+        // explicitly accepted that risk for an unsafe task. No test
+        // pins the enum-level wire form.
+        let event = MailboxEvent::TaskRequeued {
+            task_id: Uuid::from_u128(31),
+            lease_id: Uuid::from_u128(32),
+            reason: "operator".into(),
+            duplicate_risk: A2ADuplicateRisk::Idempotent,
+            requeued_at_ms: 40_000,
+            attempt: 2,
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("MailboxEvent serialises as a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "attempt",
+                "duplicate_risk",
+                "lease_id",
+                "reason",
+                "requeued_at_ms",
+                "task_id",
+                "type",
+            ],
+            "MailboxEvent::TaskRequeued wire form must be exactly seven \
+             keys: the six variant fields plus the 'type' discriminator. \
+             A refactor that renamed any of task_id, lease_id, reason, \
+             duplicate_risk, requeued_at_ms, or attempt without \
+             #[serde(rename = ...)] would silently fail decode on every \
+             prior JSONL TaskRequeued row, the operator's lease-repair \
+             audit trail would rebuild empty, and the audit log could \
+             no longer attribute the requeue to its operator, reason, \
+             or original lease",
+        );
+        assert_eq!(
+            obj.get("type"),
+            Some(&serde_json::json!("task_requeued")),
+            "MailboxEvent discriminator slug must be snake_case \
+             'task_requeued'; a slug regression silently strands every \
+             prior JSONL TaskRequeued row at replay, the \
+             in-flight-then-requeue history rebuilds with the lease \
+             still appearing in-flight, and operator audit queries that \
+             grep on the slug return zero hits while requeue-on-requeue \
+             chains lose their original lease provenance",
+        );
+        assert_eq!(
+            obj.get("duplicate_risk"),
+            Some(&serde_json::json!("idempotent")),
+            "MailboxEvent::TaskRequeued::duplicate_risk must surface as \
+             the snake_case 'idempotent' slug; a refactor that flipped \
+             rename_all on A2ADuplicateRisk would turn this into \
+             'Idempotent' or a camelCase variant and every prior JSONL \
+             TaskRequeued row would fail decode at the nested enum — \
+             every requeue audit row would be stranded and downstream \
+             consumers grepping on the slug would return zero hits",
+        );
+
+        let back: MailboxEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            back, event,
+            "MailboxEvent::TaskRequeued must round-trip through \
+             serde_json verbatim — the PartialEq derive is the contract \
+             the JsonlMailbox::open replay path joins repair events \
+             against",
+        );
+
+        for required in [
+            "task_id",
+            "lease_id",
+            "reason",
+            "duplicate_risk",
+            "requeued_at_ms",
+            "attempt",
+        ] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<MailboxEvent>(serde_json::Value::Object(missing)).is_err(),
+                "MailboxEvent::TaskRequeued wire form must reject a \
+                 payload missing {required:?}; a stray #[serde(default)] \
+                 on duplicate_risk would let a malformed row decode with \
+                 A2ADuplicateRisk::default() and replay would lose the \
+                 distinction between an idempotent-safe requeue and an \
+                 operator-accepted-unsafe requeue — audit dashboards \
+                 counting requeue reasons would silently misclassify \
+                 the row",
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_event_task_force_errored_serde_pins_six_field_variant() {
+        // MailboxEvent::TaskForceErrored is the operator-initiated
+        // lease-fail repair event the daemon appends to the JSONL
+        // mailbox log when an in-flight task is force-errored — the
+        // operator's ForceError repair command terminates the lease and
+        // synthesises a failure result for the sender. With
+        // #[serde(tag = "type", rename_all = "snake_case")] on the
+        // enum, the wire object is exactly seven keys:
+        // type='task_force_errored' plus task_id (Uuid), lease_id
+        // (Uuid), result (nested A2ATaskResult with task_id,
+        // status='error', content, error_message), reason (String —
+        // the operator's free-text reason), forced_at_ms (u64),
+        // attempt (u32). No test pins the enum-level wire form. A
+        // refactor that flipped the discriminator slug, renamed any of
+        // the six fields, added #[serde(default)] to any non-Option
+        // field, or restructured the nested A2ATaskResult would
+        // silently corrupt repair replay — operator force-error events
+        // would either be stranded entirely or rebuild without their
+        // original failure-result attribution, leaving the sender's
+        // recv_result with no signal that the lease was operator-killed.
+        let result = A2ATaskResult::error(Uuid::from_u128(41), "killed");
+        let event = MailboxEvent::TaskForceErrored {
+            task_id: Uuid::from_u128(41),
+            lease_id: Uuid::from_u128(42),
+            result: result.clone(),
+            reason: "operator".into(),
+            forced_at_ms: 50_000,
+            attempt: 3,
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("MailboxEvent serialises as a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "attempt",
+                "forced_at_ms",
+                "lease_id",
+                "reason",
+                "result",
+                "task_id",
+                "type",
+            ],
+            "MailboxEvent::TaskForceErrored wire form must be exactly \
+             seven keys: the six variant fields plus the 'type' \
+             discriminator. A refactor that renamed any of task_id, \
+             lease_id, result, reason, forced_at_ms, or attempt without \
+             #[serde(rename = ...)] would silently fail decode on every \
+             prior JSONL TaskForceErrored row and the audit trail of \
+             operator-initiated lease kills would rebuild empty — \
+             operator triage could not reconstruct which leases were \
+             force-errored, by whom, and with what reason",
+        );
+        assert_eq!(
+            obj.get("type"),
+            Some(&serde_json::json!("task_force_errored")),
+            "MailboxEvent discriminator slug must be snake_case \
+             'task_force_errored'; a refactor that replaced rename_all \
+             with camelCase (yielding 'taskForceErrored') silently \
+             strands every prior JSONL TaskForceErrored row at replay, \
+             the operator-killed lease history rebuilds empty, and the \
+             sender's recv_result loop blocks indefinitely waiting for \
+             a result the operator already synthesised",
+        );
+
+        let result_obj = obj
+            .get("result")
+            .and_then(serde_json::Value::as_object)
+            .expect(
+                "MailboxEvent::TaskForceErrored::result must serialise as a nested JSON object",
+            );
+        assert_eq!(
+            result_obj
+                .get("task_id")
+                .and_then(serde_json::Value::as_str),
+            Some(Uuid::from_u128(41).to_string().as_str()),
+            "MailboxEvent::TaskForceErrored::result.task_id must match \
+             the outer task_id — the sender's recv_result joins on this \
+             id and any drift silently delivers a result no caller is \
+             listening for",
+        );
+        assert_eq!(
+            result_obj
+                .get("error_message")
+                .and_then(serde_json::Value::as_str),
+            Some("killed"),
+            "MailboxEvent::TaskForceErrored::result.error_message must \
+             surface the operator's failure message — a refactor that \
+             dropped error_message from the nested A2ATaskResult would \
+             leave the sender with no actionable signal that the lease \
+             was operator-killed",
+        );
+
+        let back: MailboxEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            back, event,
+            "MailboxEvent::TaskForceErrored must round-trip through \
+             serde_json verbatim — the PartialEq derive is the contract \
+             the JsonlMailbox::open replay path joins repair events \
+             against",
+        );
+
+        for required in [
+            "task_id",
+            "lease_id",
+            "result",
+            "reason",
+            "forced_at_ms",
+            "attempt",
+        ] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<MailboxEvent>(serde_json::Value::Object(missing)).is_err(),
+                "MailboxEvent::TaskForceErrored wire form must reject a \
+                 payload missing {required:?}; a stray #[serde(default)] \
+                 on result would let a malformed row decode with \
+                 A2ATaskResult::default() (task_id Uuid::nil(), status \
+                 default-variant, content [], error_message None) and \
+                 replay would enqueue that synthetic zero-result entry \
+                 under the original lease — recv_result would silently \
+                 deliver a nil-task error to the sender, masking the \
+                 real operator-initiated kill with a fake nil-task \
+                 error",
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_event_idempotency_result_cached_serde_pins_nested_wire_form() {
+        // MailboxEvent::IdempotencyResultCached is the JSONL mailbox
+        // replay event the daemon appends when a task completes and
+        // its result is cached against the task's A2AIdempotency cache
+        // key — the subsequent duplicate-send for the same
+        // sender/recipient/task_kind/key tuple is served from this
+        // cache rather than re-dispatched. With #[serde(tag = "type",
+        // rename_all = "snake_case")] on the enum, the wire object is
+        // exactly three top-level keys: type='idempotency_result_cached'
+        // plus cache_key (nested A2AIdempotencyCacheKey:
+        // sender_pubkey_b58, recipient_pubkey_b58, task_kind, key) plus
+        // result (nested A2AIdempotencyCachedResult: source_task_id,
+        // status, content with #[serde(default)], error_message under
+        // skip_if_none). a2a_idempotency_cached_result_serde_pins_four_field_wire_form
+        // and a2a_idempotency_cache_key_serde_pins_four_required_fields
+        // cover the inner payloads, but no test pins the enum-level
+        // struct-variant wrapper. A refactor that promoted
+        // IdempotencyResultCached from a struct variant to a newtype
+        // variant would silently flatten one of the nested types next
+        // to 'type' on the wire and every prior JSONL row would fail
+        // decode at replay — the result cache rebuilds empty across
+        // daemon restart and every duplicate-send re-dispatches the
+        // task instead of replaying its cached result, breaking the
+        // idempotency guarantee for repeat senders.
+        let cache_key = A2AIdempotencyCacheKey {
+            sender_pubkey_b58: "sender_pk".into(),
+            recipient_pubkey_b58: "recipient_pk".into(),
+            task_kind: "research.lookup".into(),
+            key: "job-1".into(),
+        };
+        let result = A2AIdempotencyCachedResult {
+            source_task_id: Uuid::from_u128(51),
+            status: A2ATaskStatus::Ok,
+            content: Vec::new(),
+            error_message: None,
+        };
+        let event = MailboxEvent::IdempotencyResultCached {
+            cache_key: cache_key.clone(),
+            result: result.clone(),
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("MailboxEvent serialises as a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["cache_key", "result", "type"],
+            "MailboxEvent::IdempotencyResultCached wire form must be \
+             exactly three top-level keys: 'type' plus the two nested \
+             fields. A refactor that promoted the variant from struct \
+             to newtype would flatten one of the nested objects next to \
+             'type' and every prior JSONL row that nests under \
+             cache_key+result would silently fail decode at replay — \
+             the result cache would rebuild empty across daemon restart \
+             and every duplicate-send would re-dispatch the task \
+             instead of replaying its cached result",
+        );
+        assert_eq!(
+            obj.get("type"),
+            Some(&serde_json::json!("idempotency_result_cached")),
+            "MailboxEvent discriminator slug must be snake_case \
+             'idempotency_result_cached'; a slug regression silently \
+             strands every prior JSONL row at replay, the result cache \
+             rebuilds empty, and the daemon silently re-executes \
+             duplicate-sends instead of replaying the cached result — \
+             exposing the worker to repeated work and the sender to \
+             inconsistent results when the second execution diverges \
+             from the first",
+        );
+
+        let cache_key_obj = obj
+            .get("cache_key")
+            .and_then(serde_json::Value::as_object)
+            .expect("cache_key must serialise as a nested JSON object");
+        for required in [
+            "sender_pubkey_b58",
+            "recipient_pubkey_b58",
+            "task_kind",
+            "key",
+        ] {
+            assert!(
+                cache_key_obj.contains_key(required),
+                "cache_key must surface {required:?} at the nested \
+                 level; the cache lookup tuple is what makes the \
+                 idempotency guarantee load-bearing — a missing field \
+                 silently widens or narrows the match and a stranger's \
+                 cached result can leak to a different sender",
+            );
+        }
+
+        let result_obj = obj
+            .get("result")
+            .and_then(serde_json::Value::as_object)
+            .expect("result must serialise as a nested JSON object");
+        assert_eq!(
+            result_obj
+                .get("source_task_id")
+                .and_then(serde_json::Value::as_str),
+            Some(Uuid::from_u128(51).to_string().as_str()),
+            "result.source_task_id must surface as the Uuid's \
+             hyphenated string form — the cached result's provenance \
+             back to the originating task is the audit trail operators \
+             use to reconstruct cache hits",
+        );
+
+        let back: MailboxEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            back, event,
+            "MailboxEvent::IdempotencyResultCached must round-trip \
+             through serde_json verbatim — the PartialEq derive is the \
+             contract the JsonlMailbox::open replay path joins cache \
+             events against",
+        );
+
+        for required in ["cache_key", "result"] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<MailboxEvent>(serde_json::Value::Object(missing)).is_err(),
+                "MailboxEvent::IdempotencyResultCached wire form must \
+                 reject a payload missing {required:?}; a stray \
+                 #[serde(default)] on cache_key would let a malformed \
+                 row decode with A2AIdempotencyCacheKey::default() and \
+                 replay would bind the cached result to the all-empty \
+                 tuple — a future legitimate sender whose key matches \
+                 the empty-default tuple would silently receive a \
+                 stranger's cached result, while a default on result \
+                 would cache a synthetic nil-task A2AIdempotencyCachedResult \
+                 against the original cache_key and every subsequent \
+                 duplicate-send for that key would replay the zero-result",
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_event_idempotency_result_replayed_serde_pins_nested_wire_form() {
+        // MailboxEvent::IdempotencyResultReplayed is the JSONL mailbox
+        // replay event the daemon appends when send_task receives a
+        // duplicate request that matches a prior task's A2AIdempotency
+        // cache key — instead of re-dispatching the task, the daemon
+        // synthesises a fresh A2ATaskResult from the cached entry and
+        // enqueues both the inbound task envelope and the cached result
+        // so recv_task and recv_result can deliver the replay to the
+        // new sender. With #[serde(tag = "type", rename_all =
+        // "snake_case")] on the enum, the wire object is exactly three
+        // top-level keys: type='idempotency_result_replayed' plus task
+        // (nested A2ATask: id, sender, recipient, intent_text, four
+        // Option fields under skip_if_none) plus result (nested
+        // A2ATaskResult: task_id, status, content with
+        // #[serde(default)], error_message under skip_if_none).
+        // a2a_task_serde_pins_four_required_and_four_option_skip_empty
+        // and a2a_task_result_serde_pins_content_default_and_error_message_skip_empty
+        // cover the inner payloads, and the sibling TaskSent /
+        // ResultPosted struct-variant pins cover their wrappers, but no
+        // test pins the IdempotencyResultReplayed enum-level wrapper.
+        // A refactor that promoted IdempotencyResultReplayed from a
+        // struct variant to a newtype variant would silently flatten
+        // one of the nested types next to 'type' on the wire and every
+        // prior JSONL replay row would fail decode at
+        // JsonlMailbox::open — duplicate-sends that were already
+        // replayed before the restart silently re-execute the task on
+        // the recipient side and their senders never see the result
+        // that was already produced upstream of the restart.
+        let mut task = dummy_task();
+        task.id = Uuid::from_u128(61);
+        let result = A2ATaskResult::ok(Uuid::from_u128(61), Vec::new());
+        let event = MailboxEvent::IdempotencyResultReplayed {
+            task: task.clone(),
+            result: result.clone(),
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("MailboxEvent serialises as a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["result", "task", "type"],
+            "MailboxEvent::IdempotencyResultReplayed wire form must be \
+             exactly three top-level keys: 'type' plus the two nested \
+             fields. A refactor that promoted the variant from struct \
+             to newtype would flatten one of the nested objects next \
+             to 'type' and every prior JSONL replay row that nests \
+             under task+result would silently fail decode at \
+             JsonlMailbox::open — duplicate-sends that were already \
+             replayed before the restart would silently re-execute on \
+             the recipient and their senders would never see the \
+             cached result they were entitled to",
+        );
+        assert_eq!(
+            obj.get("type"),
+            Some(&serde_json::json!("idempotency_result_replayed")),
+            "MailboxEvent discriminator slug must be snake_case \
+             'idempotency_result_replayed'; a refactor that flipped \
+             the slug or removed rename_all = \"snake_case\" silently \
+             strands every prior JSONL replay row at restart, the \
+             duplicate-send replay history rebuilds empty, and the \
+             daemon silently re-dispatches every duplicate as a fresh \
+             task — exposing the recipient to repeated work and the \
+             sender to inconsistent results when the second execution \
+             diverges from the first",
+        );
+
+        let task_obj = obj
+            .get("task")
+            .and_then(serde_json::Value::as_object)
+            .expect(
+                "MailboxEvent::IdempotencyResultReplayed::task must \
+                 serialise as a nested JSON object",
+            );
+        for required in ["id", "sender", "recipient", "intent_text"] {
+            assert!(
+                task_obj.contains_key(required),
+                "MailboxEvent::IdempotencyResultReplayed::task must \
+                 surface the four required A2ATask fields at the \
+                 nested level; missing {required:?} would break the \
+                 cross-event join replay uses to attribute the \
+                 replayed task to its sender and recipient",
+            );
+        }
+        assert_eq!(
+            task_obj.get("id").and_then(serde_json::Value::as_str),
+            Some(Uuid::from_u128(61).to_string().as_str()),
+            "MailboxEvent::IdempotencyResultReplayed::task.id must \
+             surface as the Uuid's hyphenated string form — replay \
+             correlates the synthesised task envelope with its \
+             matching result by this exact representation",
+        );
+
+        let result_obj = obj
+            .get("result")
+            .and_then(serde_json::Value::as_object)
+            .expect(
+                "MailboxEvent::IdempotencyResultReplayed::result must \
+                 serialise as a nested JSON object",
+            );
+        for required in ["task_id", "status", "content"] {
+            assert!(
+                result_obj.contains_key(required),
+                "MailboxEvent::IdempotencyResultReplayed::result must \
+                 surface {required:?} at the nested level; missing \
+                 this key would break the recv_result delivery the \
+                 sender depends on after a duplicate-send replay",
+            );
+        }
+        assert_eq!(
+            result_obj
+                .get("task_id")
+                .and_then(serde_json::Value::as_str),
+            Some(Uuid::from_u128(61).to_string().as_str()),
+            "MailboxEvent::IdempotencyResultReplayed::result.task_id \
+             must surface as the Uuid's hyphenated string form — \
+             replay matches the synthesised result against the \
+             enqueued task envelope by this exact representation",
+        );
+        assert_eq!(
+            result_obj.get("content"),
+            Some(&serde_json::json!([])),
+            "MailboxEvent::IdempotencyResultReplayed::result.content \
+             must surface as [] for an empty-content result — a \
+             refactor that added skip_serializing_if = Vec::is_empty \
+             would drop the column on the wire and break downstream \
+             consumers that destructure on key presence",
+        );
+
+        let back: MailboxEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            back, event,
+            "MailboxEvent::IdempotencyResultReplayed must round-trip \
+             through serde_json verbatim — the PartialEq derive is \
+             the contract the JsonlMailbox::open replay path joins \
+             mailbox events against",
+        );
+
+        for required in ["task", "result"] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<MailboxEvent>(serde_json::Value::Object(missing)).is_err(),
+                "MailboxEvent::IdempotencyResultReplayed wire form \
+                 must reject a payload missing {required:?}; a stray \
+                 #[serde(default)] on task would let a malformed row \
+                 decode with A2ATask::default() and enqueue a \
+                 zero-payload envelope alongside the cached result — \
+                 recv_task would hand the recipient an unrouteable \
+                 task whose id can never match a real send_task \
+                 request, while a default on result would decode with \
+                 A2ATaskResult::default() and recv_result would \
+                 deliver an empty Ok payload to the sender instead of \
+                 the cached content the original task produced",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_task_pins_task_kind_and_idempotency_key_emptiness_arms() {
+        // Baseline: kind=None, idempotency=None is the legacy shape and
+        // must validate so older senders keep working.
+        assert!(validate_task(&dummy_task()).is_ok());
+
+        // task_kind=Some(empty) → InvalidTask. An all-whitespace kind
+        // must be rejected identically so the check cannot be silently
+        // bypassed by typing spaces into the field.
+        for empty in ["", "   "] {
+            let mut t = dummy_task();
+            t.task_kind = Some(empty.into());
+            let err = validate_task(&t).unwrap_err();
+            match err {
+                A2AError::InvalidTask(message) => assert!(
+                    message.contains("task_kind must not be empty when present"),
+                    "unexpected InvalidTask payload: {message:?}",
+                ),
+                other => panic!("expected InvalidTask, got {other:?}"),
+            }
+        }
+
+        // task_kind=Some(non-empty) validates Ok. A regression that
+        // inverted the trim().is_empty() check would block every
+        // explicit kind metadata send, so pin the accept path too.
+        let mut kind_ok = dummy_task();
+        kind_ok.task_kind = Some("research.lookup".into());
+        assert!(validate_task(&kind_ok).is_ok());
+
+        // idempotency present with empty/whitespace key → InvalidTask.
+        // The check must run regardless of duplicate_safety so an
+        // Unsafe-tagged send with an empty key still fails fast instead
+        // of silently producing zero-byte cache keys in receivers that
+        // later upgrade the tag.
+        for empty in ["", "   "] {
+            for safety in [A2ADuplicateSafety::Idempotent, A2ADuplicateSafety::Unsafe] {
+                let mut t = dummy_task();
+                t.idempotency = Some(A2AIdempotency::new(safety, empty));
+                let err = validate_task(&t).unwrap_err();
+                match err {
+                    A2AError::InvalidTask(message) => assert!(
+                        message.contains("idempotency key must not be empty"),
+                        "unexpected InvalidTask payload: {message:?}",
+                    ),
+                    other => panic!("expected InvalidTask, got {other:?}"),
+                }
+            }
+        }
+
+        // idempotency present with non-empty key → Ok regardless of
+        // duplicate_safety; idempotency_cache_key handles the
+        // Unsafe-vs-Idempotent caching decision separately.
+        for safety in [A2ADuplicateSafety::Idempotent, A2ADuplicateSafety::Unsafe] {
+            let mut t = dummy_task();
+            t.idempotency = Some(A2AIdempotency::new(safety, "k"));
+            assert!(validate_task(&t).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_task_rejects_empty_intent_text() {
+        // intent_text is a required wire field and the router's primary
+        // routing signal; an empty or whitespace-only value yields an
+        // unroutable task and collapses the idempotency_cache_key
+        // discriminator fallback used when task_kind is absent. Reject it at
+        // the send boundary like task_kind. trim() is required so a
+        // whitespace-only value cannot bypass the check.
+        for empty in ["", "   ", "\t\n"] {
+            let mut t = dummy_task();
+            t.intent_text = empty.into();
+            let err = validate_task(&t).unwrap_err();
+            match err {
+                A2AError::InvalidTask(message) => assert!(
+                    message.contains("intent_text must not be empty"),
+                    "unexpected InvalidTask payload: {message:?}",
+                ),
+                other => panic!("expected InvalidTask, got {other:?}"),
+            }
+        }
+
+        // A non-empty intent_text validates. An inverted trim().is_empty()
+        // check would block every legitimate send, so pin the accept path.
+        let mut ok = dummy_task();
+        ok.intent_text = "find recent papers".into();
+        assert!(validate_task(&ok).is_ok());
+    }
+
+    #[test]
+    fn validate_repair_request_pins_reason_and_force_error_message_arms() {
+        let task_id = Uuid::new_v4();
+        let requeue = || A2ARepairCommand::Requeue {
+            lease_id: None,
+            duplicate_risk: A2ADuplicateRisk::Idempotent,
+        };
+        let force_error = |message: &str| A2ARepairCommand::ForceError {
+            lease_id: None,
+            message: message.into(),
+        };
+
+        // Requeue with non-empty reason validates Ok. Pin the accept
+        // path so an inverted reason check is loud.
+        assert!(validate_repair_request(&A2ARepairRequest {
+            task_id,
+            command: requeue(),
+            reason: "operator-initiated".into(),
+        })
+        .is_ok());
+
+        // Empty/whitespace reason rejects with the documented message
+        // for both Requeue and ForceError so the reason field cannot
+        // silently widen across the two variants.
+        for reason in ["", "   "] {
+            for command in [requeue(), force_error("network reset")] {
+                let err = validate_repair_request(&A2ARepairRequest {
+                    task_id,
+                    command,
+                    reason: reason.into(),
+                })
+                .unwrap_err();
+                match err {
+                    A2AError::InvalidRepair(message) => assert!(
+                        message.contains("reason must not be empty"),
+                        "unexpected InvalidRepair payload: {message:?}",
+                    ),
+                    other => panic!("expected InvalidRepair, got {other:?}"),
+                }
+            }
+        }
+
+        // ForceError with empty/whitespace message rejects even when
+        // reason is otherwise valid. The message check only fires for
+        // ForceError; Requeue does not carry a message field.
+        for message in ["", "   "] {
+            let err = validate_repair_request(&A2ARepairRequest {
+                task_id,
+                command: force_error(message),
+                reason: "operator-initiated".into(),
+            })
+            .unwrap_err();
+            match err {
+                A2AError::InvalidRepair(payload) => assert!(
+                    payload.contains("force_error message must not be empty"),
+                    "unexpected InvalidRepair payload: {payload:?}",
+                ),
+                other => panic!("expected InvalidRepair, got {other:?}"),
+            }
+        }
+
+        // ForceError with non-empty message validates Ok when reason
+        // is also non-empty. Confirms the accept path on the variant
+        // that carries the extra field.
+        assert!(validate_repair_request(&A2ARepairRequest {
+            task_id,
+            command: force_error("upstream returned 502"),
+            reason: "operator-initiated".into(),
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn event_belongs_to_droppable_pins_each_variant_lookup_and_idempotency_cache_invariant() {
+        let mut task = dummy_task();
+        let task_id = task.id;
+        let other_id = Uuid::new_v4();
+        let lease_id = Uuid::new_v4();
+        let droppable: HashSet<Uuid> = std::iter::once(task_id).collect();
+        let disjoint: HashSet<Uuid> = std::iter::once(other_id).collect();
+
+        let make_result = |id: Uuid| A2ATaskResult::ok(id, vec![]);
+        let make_cache_key = || A2AIdempotencyCacheKey {
+            sender_pubkey_b58: task.sender.pubkey_base58(),
+            recipient_pubkey_b58: task.recipient.pubkey_base58(),
+            task_kind: task.intent_text.clone(),
+            key: "k".into(),
+        };
+        let make_cached_result = || A2AIdempotencyCachedResult {
+            source_task_id: task_id,
+            status: A2ATaskStatus::Ok,
+            content: vec![],
+            error_message: None,
+        };
+
+        let task_id_variants: Vec<MailboxEvent> = vec![
+            MailboxEvent::TaskSent { task: task.clone() },
+            MailboxEvent::TaskRecv { task_id },
+            MailboxEvent::TaskLeased {
+                task_id,
+                lease_id,
+                leased_to: task.recipient.clone(),
+                leased_at_ms: 0,
+                attempt: 0,
+            },
+            MailboxEvent::TaskRequeued {
+                task_id,
+                lease_id,
+                reason: "operator".into(),
+                duplicate_risk: A2ADuplicateRisk::Idempotent,
+                requeued_at_ms: 0,
+                attempt: 0,
+            },
+            MailboxEvent::TaskForceErrored {
+                task_id,
+                lease_id,
+                result: make_result(task_id),
+                reason: "upstream".into(),
+                forced_at_ms: 0,
+                attempt: 0,
+            },
+            MailboxEvent::IdempotencyResultReplayed {
+                task: task.clone(),
+                result: make_result(task_id),
+            },
+            MailboxEvent::ResultPosted {
+                result: make_result(task_id),
+            },
+            MailboxEvent::ResultRecv { task_id },
+        ];
+
+        for ev in &task_id_variants {
+            assert!(
+                event_belongs_to_droppable(ev, &droppable),
+                "variant must be droppable when its task_id is in the set: {ev:?}",
+            );
+            assert!(
+                !event_belongs_to_droppable(ev, &disjoint),
+                "variant must not be droppable when its task_id is absent: {ev:?}",
+            );
+        }
+
+        // IdempotencyResultCached keys off the embedded result's
+        // source_task_id, NOT off any outer task_id. The cache row is
+        // droppable exactly when its source task is in the droppable
+        // set; otherwise the cache row survives compaction even though
+        // every TaskSent/Recv/etc. with that id is also non-droppable.
+        // This caps result_cache memory at the size of the still-live
+        // workload and accepts that a duplicate idempotent send arriving
+        // after a compact sweep will re-execute instead of replaying.
+        let cached_in = MailboxEvent::IdempotencyResultCached {
+            cache_key: make_cache_key(),
+            result: make_cached_result(),
+        };
+        assert!(
+            event_belongs_to_droppable(&cached_in, &droppable),
+            "cached entry whose source_task_id is droppable must drop",
+        );
+        assert!(
+            !event_belongs_to_droppable(&cached_in, &disjoint),
+            "cached entry whose source_task_id is NOT droppable must survive",
+        );
+
+        // Build a fresh cache entry whose source_task_id is the
+        // disjoint set's id, so the lookup is driven only by
+        // source_task_id (not the surrounding task's id) — guards
+        // against a future refactor that accidentally swapped the
+        // lookup field.
+        task.id = other_id;
+        let cached_other = MailboxEvent::IdempotencyResultCached {
+            cache_key: make_cache_key(),
+            result: A2AIdempotencyCachedResult {
+                source_task_id: other_id,
+                status: A2ATaskStatus::Ok,
+                content: vec![],
+                error_message: None,
+            },
+        };
+        assert!(event_belongs_to_droppable(&cached_other, &disjoint));
+        assert!(!event_belongs_to_droppable(&cached_other, &droppable));
+    }
+
+    #[test]
+    fn compute_droppable_task_ids_pins_event_accumulator_arms() {
+        // noren_a2a::compute_droppable_task_ids is the pure-function
+        // classifier the JsonlMailbox::compact path
+        // consumes to decide which task_ids are safe to drop from the
+        // on-disk JSONL log. It walks a slice of MailboxEvents and
+        // updates four collections (seen / delivered / posted / drained)
+        // per nine match arms, then filters seen task_ids by the
+        // conjunction: in delivered AND posted count > 0 AND
+        // posted == drained.
+        //
+        // The function is currently tested only INDIRECTLY through
+        // JsonlMailbox::compact integration tests.
+        // event_belongs_to_droppable_pins_each_variant_lookup_and_idempotency_cache_invariant
+        // covers the per-variant droppable lookup but NOT
+        // the per-event accumulator updates inside compute_droppable_task_ids
+        // — specifically the no-op arms (TaskRequeued,
+        // IdempotencyResultCached) and the triple-counting arm
+        // (IdempotencyResultReplayed inserts into seen, delivered, AND
+        // posted simultaneously).
+        //
+        // Pin each accumulator update at the unit-test boundary so a
+        // refactor that converted a no-op arm into an accumulator
+        // update, that dropped one of the three IdempotencyResultReplayed
+        // inserts, or that loosened the final filter from
+        // posted == drained to posted >= drained fails loud here.
+        let task_id = Uuid::from_u128(1);
+        let other_id = Uuid::from_u128(2);
+        let lease_id = Uuid::from_u128(3);
+
+        let mut task_a = dummy_task();
+        task_a.id = task_id;
+
+        let result_a = A2ATaskResult::ok(task_id, vec![]);
+        let task_recv_a = MailboxEvent::TaskRecv { task_id };
+        let result_recv_a = MailboxEvent::ResultRecv { task_id };
+        let task_sent_a = MailboxEvent::TaskSent {
+            task: task_a.clone(),
+        };
+        let task_leased_a = MailboxEvent::TaskLeased {
+            task_id,
+            lease_id,
+            leased_to: task_a.recipient.clone(),
+            leased_at_ms: 0,
+            attempt: 0,
+        };
+
+        // (1) Empty events → empty droppable set.
+        let empty = compute_droppable_task_ids(&[]);
+        assert!(
+            empty.is_empty(),
+            "compute_droppable_task_ids(&[]) must yield empty set — a refactor that seeded one of the accumulators with a default value would surface a phantom droppable id here",
+        );
+
+        // (2) TaskSent alone → not droppable (in seen but not delivered).
+        let only_sent = compute_droppable_task_ids(std::slice::from_ref(&task_sent_a));
+        assert!(
+            only_sent.is_empty(),
+            "TaskSent alone must NOT make a task_id droppable — without a TaskRecv/TaskLeased/IdempotencyResultReplayed event the task is not in delivered; a refactor that treated TaskSent as self-delivering would silently classify every queued task as droppable on next compaction",
+        );
+
+        // (3) TaskSent + TaskRecv → not droppable (no result posted).
+        let sent_recv = compute_droppable_task_ids(&[task_sent_a.clone(), task_recv_a.clone()]);
+        assert!(
+            sent_recv.is_empty(),
+            "TaskSent + TaskRecv must NOT be droppable — the posted count is zero and the filter rejects posted == 0; a refactor that swapped posted > 0 for posted >= 0 would silently classify every received-but-unprocessed task as droppable, erasing the receiver's in-flight history on next compaction",
+        );
+
+        // (4) TaskSent + TaskRecv + ResultPosted → not droppable (not drained).
+        let sent_recv_posted = compute_droppable_task_ids(&[
+            task_sent_a.clone(),
+            task_recv_a.clone(),
+            MailboxEvent::ResultPosted {
+                result: result_a.clone(),
+            },
+        ]);
+        assert!(
+            sent_recv_posted.is_empty(),
+            "TaskSent + TaskRecv + ResultPosted must NOT be droppable — the result has been posted but not drained by the sender; a refactor that loosened posted == drained to posted >= drained would silently classify this as droppable, erasing the result-in-flight evidence before the sender's ResultRecv lands",
+        );
+
+        // (5) Full lifecycle: Sent → Recv → ResultPosted → ResultRecv → droppable.
+        let full_recv_lifecycle = compute_droppable_task_ids(&[
+            task_sent_a.clone(),
+            task_recv_a.clone(),
+            MailboxEvent::ResultPosted {
+                result: result_a.clone(),
+            },
+            result_recv_a.clone(),
+        ]);
+        assert!(
+            full_recv_lifecycle.contains(&task_id),
+            "full TaskRecv-based lifecycle must be droppable — the documented happy path for non-leased delivery; a refactor that broke the final filter conjunction would fail here",
+        );
+        assert_eq!(
+            full_recv_lifecycle.len(),
+            1,
+            "full lifecycle for one task_id must yield exactly one droppable id — a refactor that double-counted would surface a phantom entry",
+        );
+
+        // (6) TaskLeased alternative: Sent → Leased → ResultPosted → ResultRecv → droppable.
+        let leased_lifecycle = compute_droppable_task_ids(&[
+            task_sent_a.clone(),
+            task_leased_a.clone(),
+            MailboxEvent::ResultPosted {
+                result: result_a.clone(),
+            },
+            result_recv_a.clone(),
+        ]);
+        assert!(
+            leased_lifecycle.contains(&task_id),
+            "TaskLeased must count as delivery identically to TaskRecv — a refactor that removed the delivered.insert from TaskLeased would silently keep every leased-then-completed task in the JSONL log forever, breaking compaction for the lease-flow path",
+        );
+
+        // (7) TaskForceErrored alternative: Sent → Recv → ForceErrored → ResultRecv → droppable.
+        let forced_lifecycle = compute_droppable_task_ids(&[
+            task_sent_a.clone(),
+            task_recv_a.clone(),
+            MailboxEvent::TaskForceErrored {
+                task_id,
+                lease_id,
+                result: result_a.clone(),
+                reason: "operator forced".into(),
+                forced_at_ms: 0,
+                attempt: 0,
+            },
+            result_recv_a.clone(),
+        ]);
+        assert!(
+            forced_lifecycle.contains(&task_id),
+            "TaskForceErrored must count as a posted result identically to ResultPosted — a refactor that removed the posted accumulator update from TaskForceErrored would silently keep every operator-forced-error task in the JSONL log forever",
+        );
+
+        // (8) TaskRequeued must be a no-op accumulator. A sequence with
+        // a TaskRequeued in place of TaskRecv would have an empty
+        // delivered set and must NOT be droppable. This is the
+        // load-bearing pin against a refactor that adds
+        // delivered.insert to the TaskRequeued arm.
+        let requeued_in_place_of_recv = compute_droppable_task_ids(&[
+            task_sent_a.clone(),
+            MailboxEvent::TaskRequeued {
+                task_id,
+                lease_id,
+                reason: "operator".into(),
+                duplicate_risk: A2ADuplicateRisk::Idempotent,
+                requeued_at_ms: 0,
+                attempt: 0,
+            },
+            MailboxEvent::ResultPosted {
+                result: result_a.clone(),
+            },
+            result_recv_a.clone(),
+        ]);
+        assert!(
+            requeued_in_place_of_recv.is_empty(),
+            "TaskRequeued alone must NOT contribute to delivered — a refactor that added delivered.insert(*task_id) to the TaskRequeued arm under the rationale that 'requeued tasks should drop too' would silently classify this sequence as droppable, the JSONL log would lose the TaskSent history for the requeued task, and operator audit would lose the requeue evidence on next compaction; the existing indirect compact tests do not exercise this exact regression because they always pair TaskRequeued with a real delivery event",
+        );
+
+        // (9) IdempotencyResultCached must be a no-op accumulator. A
+        // sequence with the cached event in place of ResultPosted has
+        // posted count zero and must NOT be droppable. Pins the
+        // accumulator no-op contract.
+        let cache_key = A2AIdempotencyCacheKey {
+            sender_pubkey_b58: task_a.sender.pubkey_base58(),
+            recipient_pubkey_b58: task_a.recipient.pubkey_base58(),
+            task_kind: task_a.intent_text.clone(),
+            key: "k".into(),
+        };
+        let cached_result = A2AIdempotencyCachedResult {
+            source_task_id: task_id,
+            status: A2ATaskStatus::Ok,
+            content: vec![],
+            error_message: None,
+        };
+        let cached_in_place_of_posted = compute_droppable_task_ids(&[
+            task_sent_a.clone(),
+            task_recv_a.clone(),
+            MailboxEvent::IdempotencyResultCached {
+                cache_key: cache_key.clone(),
+                result: cached_result.clone(),
+            },
+            result_recv_a.clone(),
+        ]);
+        assert!(
+            cached_in_place_of_posted.is_empty(),
+            "IdempotencyResultCached alone must NOT contribute to posted — a refactor that added a posted accumulator update to the IdempotencyResultCached arm would silently classify this sequence as droppable, dropping the cache-row provenance from the JSONL log; the cached row is operator-visible replay evidence and must not be auto-compacted",
+        );
+
+        // (10) IdempotencyResultReplayed triple-count contract: inserts
+        // task.id into BOTH seen and delivered, AND increments
+        // posted[result.task_id]. A single Replayed event + ResultRecv
+        // must produce a droppable task. This is the load-bearing pin
+        // against a refactor that drops any of the three accumulator
+        // updates inside the Replayed arm.
+        let replayed_only = compute_droppable_task_ids(&[
+            MailboxEvent::IdempotencyResultReplayed {
+                task: task_a.clone(),
+                result: result_a.clone(),
+            },
+            result_recv_a.clone(),
+        ]);
+        assert!(
+            replayed_only.contains(&task_id),
+            "IdempotencyResultReplayed alone (with a matching ResultRecv) must produce a droppable task — the variant's three simultaneous accumulator updates (seen.insert(task.id), delivered.insert(task.id), posted[result.task_id] += 1) are the load-bearing contract; a 'simplify the triple insert into one accumulator field' refactor that dropped seen or delivered would silently keep cache-replayed tasks from becoming droppable and the JSONL log would grow unbounded across daemon restarts for every cache-replay event",
+        );
+
+        // (11) posted > drained must NOT be droppable. The final filter
+        // is posted == drained (with posted > 0), not posted >=
+        // drained. This pin defends against a refactor that loosened
+        // the equality to greater-than-or-equal under the rationale
+        // that 'the receiver moved on without a ResultRecv'.
+        let posted_more_than_drained = compute_droppable_task_ids(&[
+            task_sent_a.clone(),
+            task_recv_a.clone(),
+            MailboxEvent::ResultPosted {
+                result: result_a.clone(),
+            },
+            MailboxEvent::ResultPosted {
+                result: result_a.clone(),
+            },
+            result_recv_a.clone(),
+        ]);
+        assert!(
+            posted_more_than_drained.is_empty(),
+            "posted > drained (here 2 > 1) must NOT be droppable — the final filter is posted == drained, not posted >= drained; a refactor that loosened the equality (e.g., 'the receiver moved on without ResultRecv so we can drop anyway') would silently widen the droppable set to include posted-but-not-fully-drained tasks, erasing the in-flight evidence for tasks whose final ResultRecv had not yet been written",
+        );
+
+        // (12) Single droppable id among multiple tasks: the function
+        // must isolate the fully-drained task_id and leave the
+        // partially-drained one in flight.
+        let mut task_b = dummy_task();
+        task_b.id = other_id;
+        let mixed = compute_droppable_task_ids(&[
+            task_sent_a.clone(),
+            task_recv_a.clone(),
+            MailboxEvent::ResultPosted {
+                result: result_a.clone(),
+            },
+            result_recv_a.clone(),
+            // task_b is sent and received but never gets a ResultPosted.
+            MailboxEvent::TaskSent { task: task_b },
+            MailboxEvent::TaskRecv { task_id: other_id },
+        ]);
+        assert!(
+            mixed.contains(&task_id),
+            "fully-drained task_a must be droppable in the mixed scenario",
+        );
+        assert!(
+            !mixed.contains(&other_id),
+            "partially-drained task_b (no ResultPosted) must NOT be droppable in the mixed scenario — a refactor that crossed wires between the four accumulator maps would surface a phantom droppable id here",
+        );
+        assert_eq!(
+            mixed.len(),
+            1,
+            "exactly one droppable id in the mixed scenario — a refactor that broke isolation between task_ids in the four accumulators would surface multiple ids here",
+        );
+    }
+
+    #[test]
+    fn assert_lease_match_pins_expected_actual_and_none_paths() {
+        let task_id = Uuid::new_v4();
+        let lease_a = Uuid::new_v4();
+        let lease_b = Uuid::new_v4();
+
+        // expected=None means the caller did not pin a specific lease,
+        // so any actual must be accepted including None and Some(x).
+        assert!(assert_lease_match(task_id, None, None).is_ok());
+        assert!(assert_lease_match(task_id, None, Some(lease_a)).is_ok());
+
+        // Same-lease match returns Ok so operator-initiated repair under
+        // a pinned lease still flows through.
+        assert!(assert_lease_match(task_id, Some(lease_a), Some(lease_a)).is_ok());
+
+        // Mismatched lease returns LeaseMismatch and binds task_id,
+        // expected, and actual so the caller can surface both lease ids
+        // in the audit trail.
+        let err = assert_lease_match(task_id, Some(lease_a), Some(lease_b)).unwrap_err();
+        match err {
+            A2AError::LeaseMismatch {
+                task_id: tid,
+                expected,
+                actual,
+            } => {
+                assert_eq!(tid, task_id);
+                assert_eq!(expected, Some(lease_a));
+                assert_eq!(actual, Some(lease_b));
+            }
+            other => panic!("expected LeaseMismatch, got {other:?}"),
+        }
+
+        // expected=Some, actual=None still mismatches so a never-leased
+        // task cannot be silently repaired under an explicit lease_id.
+        let err = assert_lease_match(task_id, Some(lease_a), None).unwrap_err();
+        match err {
+            A2AError::LeaseMismatch {
+                task_id: tid,
+                expected,
+                actual,
+            } => {
+                assert_eq!(tid, task_id);
+                assert_eq!(expected, Some(lease_a));
+                assert_eq!(actual, None);
+            }
+            other => panic!("expected LeaseMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a2a_error_display_messages_pin_five_string_variant_format_strings() {
+        let closed = format!("{}", A2AError::Closed);
+        assert_eq!(
+            closed, "mailbox closed",
+            "A2AError::Closed Display drifted (typo regression class)"
+        );
+
+        let task_id = Uuid::nil();
+        let not_in_flight = format!("{}", A2AError::TaskNotInFlight(task_id));
+        assert_eq!(
+            not_in_flight, "task 00000000-0000-0000-0000-000000000000 is not currently leased",
+            "A2AError::TaskNotInFlight Display drifted (typo or qualifier-drop regression class)"
+        );
+
+        let expected = Uuid::from_u128(1);
+        let actual = Uuid::from_u128(2);
+        let mismatch = format!(
+            "{}",
+            A2AError::LeaseMismatch {
+                task_id,
+                expected: Some(expected),
+                actual: Some(actual),
+            }
+        );
+        assert!(
+            mismatch.contains("lease mismatch for task 00000000-0000-0000-0000-000000000000"),
+            "A2AError::LeaseMismatch task_id slot drifted (typo regression class): {mismatch}"
+        );
+        assert!(
+            mismatch.contains("expected Some(") && mismatch.contains("00000000-0000-0000-0000-000000000001"),
+            "A2AError::LeaseMismatch expected slot drifted (slot-swap or debug-vs-display regression class): {mismatch}"
+        );
+        assert!(
+            mismatch.contains("actual Some(") && mismatch.contains("00000000-0000-0000-0000-000000000002"),
+            "A2AError::LeaseMismatch actual slot drifted (slot-swap or debug-vs-display regression class): {mismatch}"
+        );
+        assert!(
+            !mismatch.contains("expected Some(00000000-0000-0000-0000-000000000002"),
+            "A2AError::LeaseMismatch expected slot bound to actual value (slot-swap regression class): {mismatch}"
+        );
+        assert!(
+            !mismatch.contains("actual Some(00000000-0000-0000-0000-000000000001"),
+            "A2AError::LeaseMismatch actual slot bound to expected value (slot-swap regression class): {mismatch}"
+        );
+
+        let invalid_task = format!(
+            "{}",
+            A2AError::InvalidTask("reason must not be empty".into())
+        );
+        assert_eq!(
+            invalid_task, "invalid task: reason must not be empty",
+            "A2AError::InvalidTask Display drifted (typo or prefix-convergence regression class)"
+        );
+
+        let invalid_repair = format!(
+            "{}",
+            A2AError::InvalidRepair("reason must not be empty".into())
+        );
+        assert_eq!(
+            invalid_repair, "invalid repair request: reason must not be empty",
+            "A2AError::InvalidRepair Display drifted (typo or prefix-convergence regression class)"
+        );
+    }
+
+    #[test]
+    fn a2a_error_io_and_serde_display_messages_pin_prefix_and_external_source_display_delegation() {
+        let io_err = A2AError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "mailbox.jsonl missing",
+        ));
+        let io_message = format!("{io_err}");
+        assert!(
+            io_message.starts_with("io: "),
+            "A2AError::Io must surface the literal 'io: ' bootstrap-stage prefix so audit-log filters can distinguish mailbox-file disk faults from JSONL row-parse faults in the leased-queue serve loop (dropped-prefix regression class): {io_message}"
+        );
+        assert!(
+            io_message.contains("mailbox.jsonl missing"),
+            "A2AError::Io must surface the inner std::io::Error Display rendering after the colon ({{0}}, not {{0:?}}); a Debug refactor would render 'Custom {{ kind: NotFound, error: ... }}' instead of the message payload (Debug-vs-Display formatting regression class on the {{0}} interpolation): {io_message}"
+        );
+        assert!(
+            !io_message.contains("Custom {") && !io_message.contains("Os {"),
+            "A2AError::Io must NOT surface the std::io::Error Debug rendering; a Debug refactor on {{0}} would expose internal struct fields like 'Custom {{ kind: ..., error: ... }}' or 'Os {{ code: ..., kind: ..., message: ... }}' (Debug-vs-Display formatting regression class on the {{0}} interpolation): {io_message}"
+        );
+
+        let serde_source =
+            serde_json::from_str::<serde_json::Value>("not json").expect_err("parse must fail");
+        let serde_err = A2AError::Serde(serde_source);
+        let serde_message = format!("{serde_err}");
+        assert!(
+            serde_message.starts_with("serde: "),
+            "A2AError::Serde must surface the literal 'serde: ' bootstrap-stage prefix so audit-log filters can distinguish JSONL row-parse faults from disk faults in the leased-queue serve loop (dropped-prefix regression class): {serde_message}"
+        );
+        assert!(
+            serde_message.contains("expected"),
+            "A2AError::Serde must surface the inner serde_json::Error Display rendering after the colon (serde_json renders parse failures with 'expected ...' Display strings); a Debug refactor on {{0}} would render 'Error(\"...\", line: N, column: M)' instead (Debug-vs-Display formatting regression class on the {{0}} interpolation): {serde_message}"
+        );
+        assert!(
+            !serde_message.contains("Error("),
+            "A2AError::Serde must NOT surface the serde_json::Error Debug rendering; a Debug refactor on {{0}} would expose 'Error(\"...\", line: N, column: M)' buffer-position structs (Debug-vs-Display formatting regression class on the {{0}} interpolation): {serde_message}"
+        );
+
+        assert_ne!(
+            io_message, serde_message,
+            "A2AError::Io and A2AError::Serde Display must not converge; merging the two prefixes would lose the disk-fault vs JSONL-row-parse-fault discriminator (prefix-convergence regression class): io={io_message} serde={serde_message}"
+        );
+        assert!(
+            !io_message.starts_with("serde:") && !serde_message.starts_with("io:"),
+            "A2AError::Io must not start with 'serde:' and A2AError::Serde must not start with 'io:'; a sibling-prefix swap would silently mis-route incident triage (sibling-prefix-swap regression class): io={io_message} serde={serde_message}"
+        );
+
+        let string_variant_prefixes = [
+            "mailbox closed",
+            "task ",
+            "lease mismatch for task",
+            "invalid task:",
+            "invalid repair request:",
+        ];
+        for prefix in string_variant_prefixes {
+            assert!(
+                !io_message.starts_with(prefix),
+                "A2AError::Io must not converge with the string-variant surface '{prefix}' pinned by a2a_error_display_messages_pin_five_string_variant_format_strings; a disk fault must not be mis-routed as a structured leased-queue invariant violation (string-surface-convergence regression class): {io_message}"
+            );
+            assert!(
+                !serde_message.starts_with(prefix),
+                "A2AError::Serde must not converge with the string-variant surface '{prefix}' pinned by a2a_error_display_messages_pin_five_string_variant_format_strings; a JSONL row-parse fault must not be mis-routed as a structured leased-queue invariant violation (string-surface-convergence regression class): {serde_message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_error_io_source_delegation_pin_returns_inner_std_io_error_via_std_error_source() {
+        use std::error::Error;
+
+        let inner = std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "mailbox.jsonl: writer dropped",
+        );
+        let expected_display = format!("{inner}");
+        let err = A2AError::Io(inner);
+        let source = err.source().expect(
+            "noren_a2a::A2AError::Io must surface the inner std::io::Error via std::error::Error::source so daemon-side A2A retry-policy classifiers can walk the error chain and downcast source() to std::io::Error to extract io::ErrorKind for distinct retry decisions on the mailbox JSONL store (Interrupted retries immediately, WouldBlock backs off briefly, BrokenPipe/UnexpectedEof on a fsync race escalates to operator-attention, NoSpace blocks new task acceptance, PermissionDenied escalates to operator-attention); a refactor that converted the variant from #[from] to a hand-written Error impl returning None (under a 'simpler error wrapping' rationale) would silently change source() to return None while leaving Display intact (dropped-source-attribute regression class)",
+        );
+        assert_eq!(
+            format!("{source}"),
+            expected_display,
+            "noren_a2a::A2AError::Io source() Display must match a direct format!() of the same std::io::Error verbatim; a refactor that swapped the inner field type to Box<dyn Error + Send + Sync> or any other wrapper would silently break daemon-side downcasts even though the wrapper's Display would continue to flow through {{0}} (concrete-source-type regression class)"
+        );
+        let kind = source.downcast_ref::<std::io::Error>().map(|e| e.kind());
+        assert_eq!(
+            kind,
+            Some(std::io::ErrorKind::BrokenPipe),
+            "noren_a2a::A2AError::Io source() must downcast_ref to std::io::Error so daemon-side A2A retry-policy classifiers can extract io::ErrorKind for retry decisions on the mailbox JSONL store; a refactor that wrapped the inner in a project-local newtype (e.g., A2AIoError(std::io::Error) under a 'tag A2A mailbox IO failures distinctly from sibling Io variants in other crates' rationale) would silently break downcast_ref::<std::io::Error>() at every downstream callsite that classifies mailbox JSONL faults (concrete-source-type downcast regression class)"
+        );
+    }
+
+    #[test]
+    fn a2a_error_serde_source_delegation_pin_returns_inner_serde_json_error_via_std_error_source() {
+        use std::error::Error;
+
+        let inner =
+            serde_json::from_str::<serde_json::Value>("not json").expect_err("parse must fail");
+        let expected_display = format!("{inner}");
+        let err = A2AError::Serde(inner);
+        let source = err.source().expect(
+            "noren_a2a::A2AError::Serde must surface the inner serde_json::Error via std::error::Error::source so daemon-side A2A leased-queue diagnostics can walk the error chain and downcast source() to serde_json::Error to inspect line/column or classify() for malformed-mailbox-row identification (line/column points the operator at the offending mailbox.jsonl row, classify() distinguishes Syntax-vs-Data-vs-EOF for incident triage on a corrupted leased-queue row); a refactor that converted the variant from #[from] to a hand-written Error impl returning None (under a 'simpler error wrapping' rationale) would silently change source() to return None while leaving Display intact (dropped-source-attribute regression class)",
+        );
+        assert_eq!(
+            format!("{source}"),
+            expected_display,
+            "noren_a2a::A2AError::Serde source() Display must match a direct format!() of the same serde_json::Error verbatim; a refactor that swapped the inner field type to Box<dyn Error + Send + Sync> or any other wrapper would silently break daemon-side downcasts even though the wrapper's Display would continue to flow through {{0}} (concrete-source-type regression class)"
+        );
+        assert!(
+            source.downcast_ref::<serde_json::Error>().is_some(),
+            "noren_a2a::A2AError::Serde source() must downcast_ref to serde_json::Error so daemon-side A2A leased-queue diagnostics can call serde_json::Error::line/column/classify for malformed-mailbox-row identification; a refactor that wrapped the inner in a project-local newtype (e.g., A2ASerdeError(serde_json::Error) under a 'consolidate parse errors into one Wire variant' rationale) would silently break downcast_ref::<serde_json::Error>() at every downstream callsite that classifies mailbox.jsonl parse faults (concrete-source-type downcast regression class)"
+        );
+    }
+
+    #[test]
+    fn result_status_serialises_snake_case() {
+        let r = A2ATaskResult::ok(Uuid::new_v4(), vec![]);
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"status\":\"ok\""));
+    }
+
+    #[test]
+    fn result_error_carries_message() {
+        let r = A2ATaskResult::error(Uuid::new_v4(), "no agent matched");
+        assert_eq!(r.status, A2ATaskStatus::Error);
+        assert_eq!(r.error_message.as_deref(), Some("no agent matched"));
+    }
+
+    #[test]
+    fn a2a_task_result_serde_pins_content_default_and_error_message_skip_empty() {
+        // A2ATaskResult is the wire form every recipient agent emits on
+        // send_result; it crosses IPC, HTTP, and JSONL mailbox boundaries.
+        // content rides #[serde(default)] only — empty content stays on
+        // the wire as "content":[] so CLI consumers can distinguish
+        // a populated-but-empty result from a parse error. error_message
+        // rides #[serde(default, skip_serializing_if = "Option::is_none")]
+        // so ok results emit a compact row without the field, while
+        // Some(msg) surfaces verbatim. Stale senders that omit content
+        // must still decode to an empty Vec, and explicit-null wire
+        // payloads from older daemons must decode to None.
+        let task_id = Uuid::new_v4();
+
+        let ok = A2ATaskResult::ok(task_id, vec![]);
+        let wire = serde_json::to_value(&ok).unwrap();
+        assert_eq!(
+            wire.get("content"),
+            Some(&serde_json::Value::Array(vec![])),
+            "empty content must surface as [] on the wire; a stray skip_serializing_if would break CLI consumers grepping on field presence",
+        );
+        let obj = wire.as_object().expect("wire form must be a JSON object");
+        assert!(
+            !obj.contains_key("error_message"),
+            "error_message=None must be skipped on the ok wire row; a dropped skip_serializing_if emits \"error_message\":null on every success",
+        );
+
+        let err = A2ATaskResult::error(task_id, "boom");
+        let wire = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            wire.get("error_message").and_then(|v| v.as_str()),
+            Some("boom"),
+            "Some(message) must surface verbatim on the error wire row",
+        );
+
+        let omitted: A2ATaskResult = serde_json::from_value(serde_json::json!({
+            "task_id": task_id,
+            "status": "ok",
+        }))
+        .expect("stale sender wire form that omits content/error_message must decode");
+        assert_eq!(
+            omitted.content,
+            Vec::<Content>::new(),
+            "omitted content must decode to an empty Vec via #[serde(default)]",
+        );
+        assert_eq!(
+            omitted.error_message, None,
+            "omitted error_message must decode to None via #[serde(default)]",
+        );
+
+        let null_form: A2ATaskResult = serde_json::from_value(serde_json::json!({
+            "task_id": task_id,
+            "status": "ok",
+            "content": [],
+            "error_message": null,
+        }))
+        .expect("explicit-null error_message wire form must decode for older daemons");
+        assert_eq!(null_form.error_message, None);
+
+        let round_trip: A2ATaskResult =
+            serde_json::from_value(serde_json::to_value(&ok).unwrap()).unwrap();
+        assert_eq!(
+            round_trip, ok,
+            "ok result must full-round-trip through serde"
+        );
+    }
+
+    #[test]
+    fn a2a_task_result_serde_pins_strict_required_fields_reject_on_omission() {
+        // a2a_task_result_serde_pins_content_default_and_error_message_skip_empty
+        // pins the default-bearing surface (content via #[serde(default)]
+        // and error_message via skip_serializing_if=Option::is_none) but
+        // does NOT close the canonical wire shape: it never asserts that
+        // task_id and status are strictly required and reject decoding
+        // when omitted. A future refactor that adds #[serde(default)]
+        // to either field would silently let a malformed external
+        // send_result payload decode with task_id=Uuid::nil() (then
+        // routed through the mailbox as a result for a non-existent task
+        // and only later rejected as A2AResultRejected — by which point
+        // the row has already been audited as authentic) or
+        // status=A2ATaskStatus::default() (silently demoting an Error
+        // result to Ok). Pin the strict required-fields contract on the
+        // error variant so the four-key wire shape (task_id, status,
+        // content, error_message) is exact and per-required-field
+        // omission fails at the parse boundary.
+        let task_id = Uuid::new_v4();
+        let result = A2ATaskResult::error(task_id, "boom");
+
+        let wire = serde_json::to_value(&result).unwrap();
+        let obj = wire
+            .as_object()
+            .expect("A2ATaskResult serialises as a JSON object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["task_id", "status", "content", "error_message"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            keys, expected,
+            "A2ATaskResult error wire form must be exactly four keys \
+             (task_id, status, content, error_message); a stray \
+             skip_serializing_if on error_message would shrink the error \
+             wire shape and break CLI consumers grepping on field \
+             presence to distinguish error vs ok rows",
+        );
+
+        let back: A2ATaskResult = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            back, result,
+            "A2ATaskResult error variant must round-trip through serde \
+             verbatim — the PartialEq derive is the contract every \
+             send_result consumer leans on across IPC, HTTP, and JSONL \
+             mailbox boundaries",
+        );
+
+        for required in ["task_id", "status"] {
+            let mut missing = obj.clone();
+            missing.remove(required);
+            assert!(
+                serde_json::from_value::<A2ATaskResult>(serde_json::Value::Object(missing))
+                    .is_err(),
+                "A2ATaskResult wire form must reject a payload missing {required:?}; \
+                 a stray #[serde(default)] on task_id would let malformed \
+                 send_result payloads decode to Uuid::nil() and route \
+                 through the mailbox as authentic, and a stray \
+                 #[serde(default)] on status would silently demote an \
+                 Error result to A2ATaskStatus::default()",
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_task_result_constructors_pin_status_binding_content_shape_and_error_message_asymmetry() {
+        // A2ATaskResult::ok and ::error are the constructor pair the
+        // daemon uses to convert tool
+        // execution outcomes into A2A wire responses. Both bind
+        // task_id verbatim and set status — ok() sets
+        // A2ATaskStatus::Ok with operator-supplied content and
+        // error_message=None; error() sets A2ATaskStatus::Error with
+        // content=Vec::new() (ALWAYS EMPTY, regardless of message)
+        // and error_message=Some(message). The asymmetry is
+        // documented behavior: error responses carry the failure in
+        // error_message and leave content empty so the receiver-side
+        // idempotency cache and parser don't accidentally treat error
+        // text as tool output.
+        //
+        // a2a_task_result_serde_pins_content_default_and_error_message_skip_empty
+        // and a2a_task_result_serde_pins_strict_required_fields_reject_on_omission
+        // (above) cover the wire form, but NOT the constructor
+        // composition. A refactor that 'for consistency' made error()
+        // populate content with Content::text(message.clone()) would
+        // silently change the wire shape, and any downstream consumer
+        // that distinguishes content-presence as success would
+        // regress. A refactor that swapped status to Ok in error()
+        // would silently break norend's status-driven dispatch
+        // and audit-row classification.
+        let task_id = Uuid::new_v4();
+
+        // (1) ok() with non-empty content
+        let ok_result = A2ATaskResult::ok(task_id, vec![Content::text("hello")]);
+        assert_eq!(
+            ok_result.status,
+            A2ATaskStatus::Ok,
+            "A2ATaskResult::ok must set status to A2ATaskStatus::Ok; \
+             a refactor that flipped the bound status would silently \
+             let ok responses surface as errors in norend's status-\
+             driven dispatch path",
+        );
+        assert_eq!(
+            ok_result.content,
+            vec![Content::text("hello")],
+            "ok() must pass content through verbatim; a refactor that \
+             normalized or wrapped the content (e.g., always set to \
+             a single text block under a 'flatten content for downstream \
+             consumers' rationale) would silently change the wire shape",
+        );
+        assert_eq!(
+            ok_result.error_message, None,
+            "ok() must leave error_message as None; a refactor that \
+             populated it with an empty string would silently let \
+             receiver-side parsers that distinguish None vs Some(\"\") \
+             treat every ok response as carrying an unread error tag",
+        );
+        assert_eq!(
+            ok_result.task_id, task_id,
+            "ok() must preserve task_id verbatim — a refactor that \
+             generated a fresh Uuid would silently break the \
+             request/response correlation that send_task and \
+             recv_result rely on for routing",
+        );
+
+        // (2) ok() with empty content — zero-length content is still
+        // an Ok, NOT an automatic conversion to error.
+        let ok_empty = A2ATaskResult::ok(task_id, vec![]);
+        assert_eq!(ok_empty.status, A2ATaskStatus::Ok);
+        assert!(
+            ok_empty.content.is_empty(),
+            "ok() with empty input content must produce empty content; \
+             a refactor that injected a placeholder Content::text(\"\") \
+             under a 'never emit empty content arrays' rationale would \
+             silently let receiver-side caches keyed on content presence \
+             match every empty Ok response",
+        );
+        assert_eq!(ok_empty.error_message, None);
+
+        // (3) error() with non-empty message: status=Error,
+        // error_message=Some(message), content=Vec::new() (ALWAYS
+        // EMPTY — the documented asymmetry).
+        let err_result = A2ATaskResult::error(task_id, "boom");
+        assert_eq!(
+            err_result.status,
+            A2ATaskStatus::Error,
+            "A2ATaskResult::error must set status to A2ATaskStatus::Error; \
+             a refactor that swapped status to Ok under an 'always return \
+             Ok and let receivers check error_message' rationale (the \
+             JSON-RPC 'always 200' anti-pattern) would silently break \
+             norend's status-driven dispatch path that keys on \
+             A2ATaskStatus::Error to mark intents Failed in the audit chain",
+        );
+        assert_eq!(
+            err_result.error_message,
+            Some("boom".to_string()),
+            "error() must wrap the message in Some — pinning that \
+             error_message is a populated Optional, not threaded through \
+             the content surface",
+        );
+        assert!(
+            err_result.content.is_empty(),
+            "error() must leave content empty; a refactor that 'for \
+             consistency' populated content with Content::text(message) \
+             under a 'reduce two surfaces (content vs error_message) to \
+             one' rationale would silently change the wire shape so \
+             receiver-side caches keyed on (task_kind, content) would \
+             suddenly match error responses they should ignore — and \
+             any tooling UI that renders content as success surface \
+             would render error text as tool output",
+        );
+        assert_eq!(err_result.task_id, task_id);
+
+        // (4) error() with empty message: empty string still goes
+        // into Some, not None. The trim/empty filter belongs to
+        // validate_repair_request, NOT to A2ATaskResult::error.
+        let err_empty = A2ATaskResult::error(task_id, "");
+        assert_eq!(err_empty.status, A2ATaskStatus::Error);
+        assert_eq!(
+            err_empty.error_message,
+            Some(String::new()),
+            "error() with empty message must still produce \
+             error_message=Some(\"\") — a refactor that 'cleaned up' \
+             empty Optionals by mapping Some(\"\") to None under a \
+             'don't carry empty fields' rationale would silently let \
+             receiver-side code that distinguishes 'unset error_message' \
+             (Ok-shaped result with status accidentally set to Error) \
+             from 'empty error_message' (intentional empty failure tag) \
+             lose the disambiguation",
+        );
+        assert!(err_empty.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_mailbox_round_trips_a_task() {
+        let m = InMemoryMailbox::new();
+        let t = dummy_task();
+        m.send_task(t.clone()).await.unwrap();
+        let got = m.recv_task().await.unwrap();
+        assert_eq!(got, t);
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_idempotency_key() {
+        let m = InMemoryMailbox::new();
+        let mut t = dummy_task();
+        t.idempotency = Some(A2AIdempotency::new(A2ADuplicateSafety::Idempotent, "   "));
+
+        let err = m.send_task(t).await.unwrap_err();
+        assert!(matches!(err, A2AError::InvalidTask(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_task_kind() {
+        let m = InMemoryMailbox::new();
+        let mut t = dummy_task();
+        t.task_kind = Some("   ".into());
+
+        let err = m.send_task(t).await.unwrap_err();
+        assert!(matches!(err, A2AError::InvalidTask(_)));
+    }
+
+    #[tokio::test]
+    async fn in_memory_replays_cached_idempotent_result_without_delivery() {
+        let m = InMemoryMailbox::new();
+        let mut first = dummy_task();
+        first.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "research:agent-memory",
+        ));
+        m.send_task(first.clone()).await.unwrap();
+        let leased = m
+            .try_recv_task_for(&first.recipient)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.id, first.id);
+        m.send_result(A2ATaskResult::ok(
+            first.id,
+            vec![Content::text("cached answer")],
+        ))
+        .await
+        .unwrap();
+
+        let mut duplicate = first.clone();
+        duplicate.id = Uuid::new_v4();
+        m.send_task(duplicate.clone()).await.unwrap();
+
+        assert!(m
+            .try_recv_task_for(&duplicate.recipient)
+            .await
+            .unwrap()
+            .is_none());
+        let original = m.try_recv_result_for(&first.sender).await.unwrap().unwrap();
+        assert_eq!(original.task_id, first.id);
+        let replayed = m.try_recv_result_for(&first.sender).await.unwrap().unwrap();
+        assert_eq!(replayed.task_id, duplicate.id);
+        assert_eq!(replayed.status, A2ATaskStatus::Ok);
+        assert_eq!(replayed.content, vec![Content::text("cached answer")]);
+    }
+
+    #[tokio::test]
+    async fn task_kind_drives_idempotency_cache_when_present() {
+        let m = InMemoryMailbox::new();
+        let mut first = dummy_task();
+        first.intent_text = "draft release notes for alpha one".into();
+        first.task_kind = Some("release.notes".into());
+        first.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "release:v0.1.0-alpha.1",
+        ));
+        m.send_task(first.clone()).await.unwrap();
+        let _ = m
+            .try_recv_task_for(&first.recipient)
+            .await
+            .unwrap()
+            .unwrap();
+        m.send_result(A2ATaskResult::ok(
+            first.id,
+            vec![Content::text("notes ready")],
+        ))
+        .await
+        .unwrap();
+
+        let mut duplicate = first.clone();
+        duplicate.id = Uuid::new_v4();
+        duplicate.intent_text = "write final alpha release notes".into();
+        m.send_task(duplicate.clone()).await.unwrap();
+
+        assert!(m
+            .try_recv_task_for(&duplicate.recipient)
+            .await
+            .unwrap()
+            .is_none());
+        let _ = m.try_recv_result_for(&first.sender).await.unwrap().unwrap();
+        let replayed = m.try_recv_result_for(&first.sender).await.unwrap().unwrap();
+        assert_eq!(replayed.task_id, duplicate.id);
+        assert_eq!(replayed.content, vec![Content::text("notes ready")]);
+    }
+
+    #[tokio::test]
+    async fn unsafe_tasks_do_not_populate_idempotency_cache() {
+        let m = InMemoryMailbox::new();
+        let mut first = dummy_task();
+        first.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Unsafe,
+            "research:agent-memory",
+        ));
+        m.send_task(first.clone()).await.unwrap();
+        let _ = m
+            .try_recv_task_for(&first.recipient)
+            .await
+            .unwrap()
+            .unwrap();
+        m.send_result(A2ATaskResult::ok(first.id, vec![]))
+            .await
+            .unwrap();
+
+        let mut duplicate = first.clone();
+        duplicate.id = Uuid::new_v4();
+        m.send_task(duplicate.clone()).await.unwrap();
+
+        let delivered = m
+            .try_recv_task_for(&duplicate.recipient)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.id, duplicate.id);
+    }
+
+    #[tokio::test]
+    async fn in_memory_mailbox_recv_blocks_until_send() {
+        let m = std::sync::Arc::new(InMemoryMailbox::new());
+        let m_recv = m.clone();
+        let h = tokio::spawn(async move { m_recv.recv_task().await.unwrap() });
+        // Tiny yield to give the recv task a chance to park.
+        tokio::task::yield_now().await;
+        let t = dummy_task();
+        m.send_task(t.clone()).await.unwrap();
+        let got = h.await.unwrap();
+        assert_eq!(got, t);
+    }
+
+    #[tokio::test]
+    async fn try_recv_returns_none_when_empty_and_some_after_send() {
+        let m = InMemoryMailbox::new();
+        let recipient = dummy_agent("research@local");
+        assert!(m.try_recv_task_for(&recipient).await.unwrap().is_none());
+        m.send_task(dummy_task()).await.unwrap();
+        let got = m.try_recv_task_for(&recipient).await.unwrap();
+        assert!(got.is_some());
+        // After draining, empty again.
+        assert!(m.try_recv_task_for(&recipient).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn lookup_task_sender_returns_sender_after_send_and_after_recv() {
+        let m = InMemoryMailbox::new();
+        let t = dummy_task();
+        let sender = t.sender.clone();
+        m.send_task(t.clone()).await.unwrap();
+
+        // Available immediately after send.
+        assert_eq!(
+            m.lookup_task_sender(t.id).await.unwrap(),
+            Some(sender.clone())
+        );
+
+        // Still available after the task has been recv'd — the result
+        // can come back later and still attribute correctly.
+        let _ = m.recv_task().await.unwrap();
+        assert_eq!(m.lookup_task_sender(t.id).await.unwrap(), Some(sender));
+    }
+
+    #[tokio::test]
+    async fn lookup_task_sender_returns_none_for_unknown_task_id() {
+        let m = InMemoryMailbox::new();
+        assert!(m
+            .lookup_task_sender(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn recent_returns_oldest_first_without_consuming() {
+        let m = InMemoryMailbox::new();
+        let t1 = dummy_task();
+        let t2 = dummy_task();
+        let t3 = dummy_task();
+        m.send_task(t1.clone()).await.unwrap();
+        m.send_task(t2.clone()).await.unwrap();
+        m.send_task(t3.clone()).await.unwrap();
+
+        let recent = m.recent_tasks(10).await.unwrap();
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].id, t1.id, "oldest first");
+        assert_eq!(recent[2].id, t3.id, "newest last");
+
+        // recent_tasks must not drain.
+        let recipient = dummy_agent("research@local");
+        assert!(m.try_recv_task_for(&recipient).await.unwrap().is_some());
+        assert!(m.try_recv_task_for(&recipient).await.unwrap().is_some());
+        assert!(m.try_recv_task_for(&recipient).await.unwrap().is_some());
+        assert!(m.try_recv_task_for(&recipient).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recent_respects_limit_and_handles_empty() {
+        let m = InMemoryMailbox::new();
+        assert!(m.recent_tasks(10).await.unwrap().is_empty());
+        assert!(m.recent_results(10).await.unwrap().is_empty());
+
+        for _ in 0..5 {
+            m.send_task(dummy_task()).await.unwrap();
+        }
+        assert_eq!(m.recent_tasks(3).await.unwrap().len(), 3);
+        assert_eq!(m.recent_tasks(0).await.unwrap().len(), 0);
+        assert_eq!(m.recent_tasks(100).await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn in_memory_mailbox_keeps_tasks_and_results_distinct() {
+        let m = InMemoryMailbox::new();
+        let t = dummy_task();
+        let r = A2ATaskResult::ok(t.id, vec![Content::text("done")]);
+        m.send_task(t.clone()).await.unwrap();
+        m.send_result(r.clone()).await.unwrap();
+
+        let got_t = m.recv_task().await.unwrap();
+        assert_eq!(got_t.id, t.id);
+        let got_r = m.recv_result().await.unwrap();
+        assert_eq!(got_r.task_id, r.task_id);
+    }
+
+    #[tokio::test]
+    async fn jsonl_round_trips_a_task_through_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a2a").join("events.jsonl");
+        let m = JsonlMailbox::open(path.clone()).await.unwrap();
+        let t = dummy_task();
+        m.send_task(t.clone()).await.unwrap();
+        let got = m.recv_task().await.unwrap();
+        assert_eq!(got, t);
+    }
+
+    #[tokio::test]
+    async fn jsonl_preserves_task_idempotency_metadata_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a2a").join("events.jsonl");
+        let m = JsonlMailbox::open(path.clone()).await.unwrap();
+        let mut t = dummy_task();
+        t.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "research:agent-memory:2026-05-09",
+        ));
+        m.send_task(t.clone()).await.unwrap();
+
+        let reopened = JsonlMailbox::open(path).await.unwrap();
+        let queue = reopened.task_queue(10).await.unwrap();
+        assert_eq!(queue[0].task.idempotency, t.idempotency);
+        let got = reopened
+            .try_recv_task_for(&t.recipient)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.idempotency, t.idempotency);
+    }
+
+    #[tokio::test]
+    async fn jsonl_replays_cached_idempotent_result_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut first = dummy_task();
+        first.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "research:agent-memory",
+        ));
+        {
+            let m = JsonlMailbox::open(path.clone()).await.unwrap();
+            m.send_task(first.clone()).await.unwrap();
+            let _ = m
+                .try_recv_task_for(&first.recipient)
+                .await
+                .unwrap()
+                .unwrap();
+            m.send_result(A2ATaskResult::ok(
+                first.id,
+                vec![Content::text("cached answer")],
+            ))
+            .await
+            .unwrap();
+            let _ = m.try_recv_result_for(&first.sender).await.unwrap().unwrap();
+            // Intentionally no compact() here. Compact prunes the
+            // cache entry along with the rest of the source task's
+            // events; the post-compact behavior lives in
+            // jsonl_compact_drops_idempotency_cache_for_drained_source.
+        }
+
+        let reopened = JsonlMailbox::open(path).await.unwrap();
+        let mut duplicate = first.clone();
+        duplicate.id = Uuid::new_v4();
+        reopened.send_task(duplicate.clone()).await.unwrap();
+
+        assert!(reopened
+            .try_recv_task_for(&duplicate.recipient)
+            .await
+            .unwrap()
+            .is_none());
+        let replayed = reopened
+            .try_recv_result_for(&duplicate.sender)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.task_id, duplicate.id);
+        assert_eq!(replayed.content, vec![Content::text("cached answer")]);
+    }
+
+    #[tokio::test]
+    async fn jsonl_replays_pending_tasks_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let t1 = dummy_task();
+        let t2 = dummy_task();
+        {
+            let m = JsonlMailbox::open(path.clone()).await.unwrap();
+            m.send_task(t1.clone()).await.unwrap();
+            m.send_task(t2.clone()).await.unwrap();
+        }
+        let m2 = JsonlMailbox::open(path.clone()).await.unwrap();
+        let recent = m2.recent_tasks(10).await.unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].id, t1.id);
+        assert_eq!(recent[1].id, t2.id);
+    }
+
+    #[tokio::test]
+    async fn jsonl_drained_tasks_do_not_reappear_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let t1 = dummy_task();
+        let t2 = dummy_task();
+        {
+            let m = JsonlMailbox::open(path.clone()).await.unwrap();
+            m.send_task(t1.clone()).await.unwrap();
+            m.send_task(t2.clone()).await.unwrap();
+            let drained = m
+                .try_recv_task_for(&dummy_agent("research@local"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(drained.id, t1.id);
+        }
+        let m2 = JsonlMailbox::open(path.clone()).await.unwrap();
+        let recent = m2.recent_tasks(10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, t2.id);
+    }
+
+    #[tokio::test]
+    async fn jsonl_leased_tasks_are_in_flight_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let task = dummy_task();
+        {
+            let m = JsonlMailbox::open(path.clone()).await.unwrap();
+            m.send_task(task.clone()).await.unwrap();
+            let leased = m.try_recv_task_for(&task.recipient).await.unwrap().unwrap();
+            assert_eq!(leased.id, task.id);
+        }
+
+        let reopened = JsonlMailbox::open(path).await.unwrap();
+        assert!(reopened
+            .try_recv_task_for(&task.recipient)
+            .await
+            .unwrap()
+            .is_none());
+
+        let queue = reopened.task_queue(10).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].state, A2ATaskQueueState::InFlight);
+        assert_eq!(queue[0].task.id, task.id);
+        assert_eq!(queue[0].leased_to.as_ref(), Some(&task.recipient));
+        assert_eq!(queue[0].attempt, 1);
+        assert!(queue[0].lease_id.is_some());
+        assert!(queue[0].leased_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn jsonl_taskrecv_replay_leased_to_recipient() {
+        // A replayed MailboxEvent::TaskRecv leases with leased_to=None
+        // (lib.rs:973), so lease_task falls back to task.recipient
+        // (lib.rs:1039). Production only ever appends TaskLeased with an
+        // explicit lessee; TaskRecv is the legacy-JSONL replay path that fixes
+        // in-flight lease ownership after a daemon restart from such a log. The
+        // sibling reopen test drives try_recv_task_for (the Some(leased_to)
+        // arm), so this recipient fallback is otherwise never exercised.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let task = dummy_task();
+        assert_ne!(
+            task.sender, task.recipient,
+            "the fallback attributes to recipient, not sender — they must differ \
+             for the assertion to distinguish the two",
+        );
+
+        let log = [
+            MailboxEvent::TaskSent { task: task.clone() },
+            MailboxEvent::TaskRecv { task_id: task.id },
+        ];
+        let body = log
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body + "\n").unwrap();
+
+        let m = JsonlMailbox::open(path).await.unwrap();
+        let queue = m.task_queue(10).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].state, A2ATaskQueueState::InFlight);
+        assert_eq!(queue[0].task.id, task.id);
+        assert_eq!(queue[0].attempt, 1);
+        assert_eq!(
+            queue[0].leased_to.as_ref(),
+            Some(&task.recipient),
+            "a TaskRecv-replayed lease (leased_to=None) must default the lessee \
+             to the task recipient, not the sender",
+        );
+    }
+
+    #[tokio::test]
+    async fn result_post_clears_in_flight_queue_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let task = dummy_task();
+        let result = A2ATaskResult::ok(task.id, vec![Content::text("done")]);
+
+        let m = JsonlMailbox::open(path).await.unwrap();
+        m.send_task(task.clone()).await.unwrap();
+        let _ = m.try_recv_task_for(&task.recipient).await.unwrap().unwrap();
+        assert_eq!(m.task_queue(10).await.unwrap().len(), 1);
+
+        m.send_result(result.clone()).await.unwrap();
+        assert!(m.task_queue(10).await.unwrap().is_empty());
+        assert_eq!(m.recent_results(10).await.unwrap(), vec![result]);
+    }
+
+    #[tokio::test]
+    async fn in_memory_requeue_restores_in_flight_task_and_increments_attempt() {
+        let m = InMemoryMailbox::new();
+        let task = dummy_task();
+        m.send_task(task.clone()).await.unwrap();
+        let _ = m.try_recv_task_for(&task.recipient).await.unwrap().unwrap();
+
+        let in_flight = m.task_queue(10).await.unwrap();
+        let lease_id = in_flight[0].lease_id;
+        let outcome = m
+            .repair_task(A2ARepairRequest {
+                task_id: task.id,
+                command: A2ARepairCommand::Requeue {
+                    lease_id,
+                    duplicate_risk: A2ADuplicateRisk::Idempotent,
+                },
+                reason: "worker crashed before posting a result".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.action, A2ARepairAction::Requeued);
+        assert_eq!(outcome.attempt, 1);
+
+        let queued = m.task_queue(10).await.unwrap();
+        assert_eq!(queued[0].state, A2ATaskQueueState::Queued);
+        assert_eq!(queued[0].attempt, 1);
+
+        let _ = m.try_recv_task_for(&task.recipient).await.unwrap().unwrap();
+        let leased_again = m.task_queue(10).await.unwrap();
+        assert_eq!(leased_again[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn in_memory_task_queue_binding_limit_keeps_queued_before_leased() {
+        let m = InMemoryMailbox::new();
+        let tasks: Vec<A2ATask> = (0..4).map(|_| dummy_task()).collect();
+        for task in &tasks {
+            m.send_task(task.clone()).await.unwrap();
+        }
+        // Lease the first two in FIFO order, leaving tasks[2] and tasks[3]
+        // queued and tasks[0], tasks[1] in flight.
+        let recipient = tasks[0].recipient.clone();
+        for _ in 0..2 {
+            m.try_recv_task_for(&recipient).await.unwrap().unwrap();
+        }
+
+        // A limit equal to the queued count must keep exactly the queued
+        // head, in order, and drop every leased entry: queued sorts ahead
+        // of leased, then truncate caps the tail. A leased-before-queued
+        // reorder would surface the in-flight ids here; truncating before
+        // the extend would overrun the cap.
+        let bound = m.task_queue(2).await.unwrap();
+        assert_eq!(
+            bound.iter().map(|e| e.task.id).collect::<Vec<_>>(),
+            vec![tasks[2].id, tasks[3].id],
+            "binding limit must keep the queued head in order, not the leased entries",
+        );
+        assert!(
+            bound.iter().all(|e| e.state == A2ATaskQueueState::Queued),
+            "limit == queued count must drop every leased entry",
+        );
+
+        // A slack limit proves the leased entries exist past the cap, so
+        // the binding case dropped them by truncation, not by absence.
+        let full = m.task_queue(10).await.unwrap();
+        assert_eq!(
+            full.len(),
+            4,
+            "slack limit must surface all queued + leased entries"
+        );
+        assert_eq!(
+            full.iter()
+                .filter(|e| e.state == A2ATaskQueueState::InFlight)
+                .count(),
+            2,
+            "the two leased tasks must be present past the binding cap",
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_task_queue_binding_limit_keeps_queued_before_leased() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let m = JsonlMailbox::open(path).await.unwrap();
+        let tasks: Vec<A2ATask> = (0..4).map(|_| dummy_task()).collect();
+        for task in &tasks {
+            m.send_task(task.clone()).await.unwrap();
+        }
+        let recipient = tasks[0].recipient.clone();
+        for _ in 0..2 {
+            m.try_recv_task_for(&recipient).await.unwrap().unwrap();
+        }
+
+        let bound = m.task_queue(2).await.unwrap();
+        assert_eq!(
+            bound.iter().map(|e| e.task.id).collect::<Vec<_>>(),
+            vec![tasks[2].id, tasks[3].id],
+            "binding limit must keep the queued head in order, not the leased entries",
+        );
+        assert!(
+            bound.iter().all(|e| e.state == A2ATaskQueueState::Queued),
+            "limit == queued count must drop every leased entry",
+        );
+
+        let full = m.task_queue(10).await.unwrap();
+        assert_eq!(
+            full.len(),
+            4,
+            "slack limit must surface all queued + leased entries"
+        );
+        assert_eq!(
+            full.iter()
+                .filter(|e| e.state == A2ATaskQueueState::InFlight)
+                .count(),
+            2,
+            "the two leased tasks must be present past the binding cap",
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_task_queue_orders_leased_entries_by_lease_age_then_task_id() {
+        // task_queue sorts leased entries by (leased_at_ms asc, task.id asc)
+        // at lib.rs:775. in_flight is a HashMap, so its .values() order is
+        // process-random; the task.id tie-break is the only thing that makes
+        // a queue listing reproducible when several leases share a
+        // millisecond. The binding-limit test pins only the queued head and
+        // the leased count, so a b.cmp(a) flip on either key, or an
+        // Ordering::Equal tie-break, survives it. The public lease path
+        // stamps leased_at_ms from the wall clock and cannot force an
+        // equal-ms tie, so insert the leases directly to build the three-way
+        // tie the tie-break exists to resolve.
+        let m = InMemoryMailbox::new();
+        let tasks: Vec<A2ATask> = (0..5).map(|_| dummy_task()).collect();
+        let leases = [
+            (0usize, 2_000u64),
+            (1, 2_000),
+            (2, 2_000),
+            (3, 1_000),
+            (4, 3_000),
+        ];
+        {
+            let mut in_flight = m.in_flight.lock();
+            for &(i, leased_at_ms) in &leases {
+                let task = &tasks[i];
+                in_flight.insert(
+                    task.id,
+                    TaskLease {
+                        lease_id: Uuid::new_v4(),
+                        task: task.clone(),
+                        leased_to: task.recipient.clone(),
+                        leased_at_ms,
+                        attempt: 1,
+                    },
+                );
+            }
+        }
+
+        let mut tied = [tasks[0].id, tasks[1].id, tasks[2].id];
+        tied.sort();
+        let expected = vec![tasks[3].id, tied[0], tied[1], tied[2], tasks[4].id];
+
+        let queue = m.task_queue(10).await.unwrap();
+        assert_eq!(
+            queue.iter().map(|e| e.task.id).collect::<Vec<_>>(),
+            expected,
+            "leased entries must sort by lease age then task id: the 1_000ms \
+             lease first, the three 2_000ms leases in ascending id order (the \
+             HashMap-order tie-break at lib.rs:778), then the 3_000ms lease",
+        );
+        assert!(
+            queue.iter().all(|e| e.state == A2ATaskQueueState::InFlight),
+            "every task is leased, so no queued head can mask the leased ordering",
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_task_queue_orders_leased_entries_by_lease_age_then_task_id() {
+        // Parity with the in-memory backend: JsonlMailbox::task_queue
+        // (lib.rs:1318) delegates to MailboxState::task_queue (lib.rs:1054),
+        // whose own copy of the leased comparator lives at lib.rs:1073. Seed
+        // the event log with TaskLeased rows carrying a controlled
+        // leased_at_ms so replay rebuilds the same three-way tie, then open
+        // and read the queue back through the real deserialize + replay path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let tasks: Vec<A2ATask> = (0..5).map(|_| dummy_task()).collect();
+
+        let mut log = String::new();
+        for task in &tasks {
+            log.push_str(
+                &serde_json::to_string(&MailboxEvent::TaskSent { task: task.clone() }).unwrap(),
+            );
+            log.push('\n');
+        }
+        let leases = [
+            (0usize, 2_000u64),
+            (1, 2_000),
+            (2, 2_000),
+            (3, 1_000),
+            (4, 3_000),
+        ];
+        for &(i, leased_at_ms) in &leases {
+            let task = &tasks[i];
+            let event = MailboxEvent::TaskLeased {
+                task_id: task.id,
+                lease_id: Uuid::new_v4(),
+                leased_to: task.recipient.clone(),
+                leased_at_ms,
+                attempt: 1,
+            };
+            log.push_str(&serde_json::to_string(&event).unwrap());
+            log.push('\n');
+        }
+        tokio::fs::write(&path, log).await.unwrap();
+
+        let m = JsonlMailbox::open(path).await.unwrap();
+
+        let mut tied = [tasks[0].id, tasks[1].id, tasks[2].id];
+        tied.sort();
+        let expected = vec![tasks[3].id, tied[0], tied[1], tied[2], tasks[4].id];
+
+        let queue = m.task_queue(10).await.unwrap();
+        assert_eq!(
+            queue.iter().map(|e| e.task.id).collect::<Vec<_>>(),
+            expected,
+            "JsonlMailbox must order leased entries by lease age then task id \
+             after replay, matching the in-memory backend (lib.rs:1073)",
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_repair_rejects_lease_mismatch() {
+        let m = InMemoryMailbox::new();
+        let task = dummy_task();
+        m.send_task(task.clone()).await.unwrap();
+        let _ = m.try_recv_task_for(&task.recipient).await.unwrap().unwrap();
+
+        let result = m
+            .repair_task(A2ARepairRequest {
+                task_id: task.id,
+                command: A2ARepairCommand::Requeue {
+                    lease_id: Some(Uuid::new_v4()),
+                    duplicate_risk: A2ADuplicateRisk::OperatorAccepted,
+                },
+                reason: "operator accepted duplicate risk".into(),
+            })
+            .await;
+        assert!(matches!(result, Err(A2AError::LeaseMismatch { .. })));
+    }
+
+    #[tokio::test]
+    async fn jsonl_requeue_replays_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let task = dummy_task();
+        {
+            let m = JsonlMailbox::open(path.clone()).await.unwrap();
+            m.send_task(task.clone()).await.unwrap();
+            let _ = m.try_recv_task_for(&task.recipient).await.unwrap().unwrap();
+            let lease_id = m.task_queue(10).await.unwrap()[0].lease_id;
+            m.repair_task(A2ARepairRequest {
+                task_id: task.id,
+                command: A2ARepairCommand::Requeue {
+                    lease_id,
+                    duplicate_risk: A2ADuplicateRisk::OperatorAccepted,
+                },
+                reason: "lease exceeded operator threshold".into(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let reopened = JsonlMailbox::open(path).await.unwrap();
+        let queued = reopened.task_queue(10).await.unwrap();
+        assert_eq!(queued[0].state, A2ATaskQueueState::Queued);
+        assert_eq!(queued[0].attempt, 1);
+        let _ = reopened
+            .try_recv_task_for(&task.recipient)
+            .await
+            .unwrap()
+            .unwrap();
+        let leased_again = reopened.task_queue(10).await.unwrap();
+        assert_eq!(leased_again[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn jsonl_force_error_replays_pending_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let task = dummy_task();
+        {
+            let m = JsonlMailbox::open(path.clone()).await.unwrap();
+            m.send_task(task.clone()).await.unwrap();
+            let _ = m.try_recv_task_for(&task.recipient).await.unwrap().unwrap();
+            let lease_id = m.task_queue(10).await.unwrap()[0].lease_id;
+            let outcome = m
+                .repair_task(A2ARepairRequest {
+                    task_id: task.id,
+                    command: A2ARepairCommand::ForceError {
+                        lease_id,
+                        message: "operator forced failure after stale lease".into(),
+                    },
+                    reason: "recipient process exited".into(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.state, A2ARepairState::ResultPending);
+        }
+
+        let reopened = JsonlMailbox::open(path).await.unwrap();
+        assert!(reopened.task_queue(10).await.unwrap().is_empty());
+        let result = reopened
+            .try_recv_result_for(&task.sender)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, A2ATaskStatus::Error);
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("operator forced failure after stale lease")
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_persists_senders_and_pending_results_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let t = dummy_task();
+        let r = A2ATaskResult::ok(t.id, vec![Content::text("done")]);
+        {
+            let m = JsonlMailbox::open(path.clone()).await.unwrap();
+            m.send_task(t.clone()).await.unwrap();
+            // Drain the task — sender stays known so a result can still
+            // be attributed to it.
+            let _ = m.recv_task().await.unwrap();
+            m.send_result(r.clone()).await.unwrap();
+        }
+
+        let m2 = JsonlMailbox::open(path.clone()).await.unwrap();
+        assert_eq!(
+            m2.lookup_task_sender(t.id).await.unwrap(),
+            Some(t.sender.clone())
+        );
+        let got = m2.recv_result().await.unwrap();
+        assert_eq!(got, r);
+    }
+
+    #[tokio::test]
+    async fn jsonl_drained_results_do_not_reappear_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let t = dummy_task();
+        let r = A2ATaskResult::ok(t.id, vec![]);
+        {
+            let m = JsonlMailbox::open(path.clone()).await.unwrap();
+            m.send_task(t.clone()).await.unwrap();
+            m.send_result(r.clone()).await.unwrap();
+            assert!(m.try_recv_result_for(&t.sender).await.unwrap().is_some());
+        }
+        let m2 = JsonlMailbox::open(path).await.unwrap();
+        assert!(m2.try_recv_result_for(&t.sender).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn try_recv_task_for_returns_only_recipient_match() {
+        let m = InMemoryMailbox::new();
+        let alice = dummy_agent("alice@local");
+        let bob = dummy_agent("bob@local");
+        let carol = dummy_agent("carol@local");
+        // Alice -> Bob, Alice -> Carol, Alice -> Bob
+        let to_bob_1 = A2ATask {
+            id: Uuid::new_v4(),
+            sender: alice.clone(),
+            recipient: bob.clone(),
+            intent_text: "1".into(),
+            task_kind: None,
+            parent: None,
+            deadline_ms: None,
+            idempotency: None,
+        };
+        let to_carol = A2ATask {
+            id: Uuid::new_v4(),
+            sender: alice.clone(),
+            recipient: carol.clone(),
+            intent_text: "2".into(),
+            task_kind: None,
+            parent: None,
+            deadline_ms: None,
+            idempotency: None,
+        };
+        let to_bob_2 = A2ATask {
+            id: Uuid::new_v4(),
+            sender: alice.clone(),
+            recipient: bob.clone(),
+            intent_text: "3".into(),
+            task_kind: None,
+            parent: None,
+            deadline_ms: None,
+            idempotency: None,
+        };
+        m.send_task(to_bob_1.clone()).await.unwrap();
+        m.send_task(to_carol.clone()).await.unwrap();
+        m.send_task(to_bob_2.clone()).await.unwrap();
+
+        // Bob drains: gets the two addressed to him, in the order they were sent.
+        let first = m.try_recv_task_for(&bob).await.unwrap().unwrap();
+        assert_eq!(first.id, to_bob_1.id, "oldest match first");
+        let second = m.try_recv_task_for(&bob).await.unwrap().unwrap();
+        assert_eq!(second.id, to_bob_2.id);
+        assert!(m.try_recv_task_for(&bob).await.unwrap().is_none());
+
+        // Carol's task is still queued — Bob's drain didn't touch it.
+        let carol_first = m.try_recv_task_for(&carol).await.unwrap().unwrap();
+        assert_eq!(carol_first.id, to_carol.id);
+    }
+
+    #[tokio::test]
+    async fn try_recv_task_for_skips_other_recipients() {
+        let m = InMemoryMailbox::new();
+        let bob = dummy_agent("bob@local");
+        let stranger = dummy_agent("stranger@local");
+        // Bob's task is queued; stranger tries to drain — gets nothing,
+        // task is still there for Bob.
+        let to_bob = A2ATask {
+            id: Uuid::new_v4(),
+            sender: dummy_agent("alice@local"),
+            recipient: bob.clone(),
+            intent_text: "for bob only".into(),
+            task_kind: None,
+            parent: None,
+            deadline_ms: None,
+            idempotency: None,
+        };
+        m.send_task(to_bob.clone()).await.unwrap();
+        assert!(m.try_recv_task_for(&stranger).await.unwrap().is_none());
+        let got = m.try_recv_task_for(&bob).await.unwrap().unwrap();
+        assert_eq!(got.id, to_bob.id);
+    }
+
+    #[tokio::test]
+    async fn try_recv_result_for_returns_only_results_for_peers_tasks() {
+        let m = InMemoryMailbox::new();
+        let alice = dummy_agent("alice@local");
+        let dan = dummy_agent("dan@local");
+        // Alice sends two tasks; Dan sends one.
+        let alice_task_1 = A2ATask {
+            id: Uuid::new_v4(),
+            sender: alice.clone(),
+            recipient: dummy_agent("research@local"),
+            intent_text: "alice's".into(),
+            task_kind: None,
+            parent: None,
+            deadline_ms: None,
+            idempotency: None,
+        };
+        let alice_task_2 = A2ATask {
+            id: Uuid::new_v4(),
+            sender: alice.clone(),
+            recipient: dummy_agent("research@local"),
+            intent_text: "alice's other".into(),
+            task_kind: None,
+            parent: None,
+            deadline_ms: None,
+            idempotency: None,
+        };
+        let dan_task = A2ATask {
+            id: Uuid::new_v4(),
+            sender: dan.clone(),
+            recipient: dummy_agent("research@local"),
+            intent_text: "dan's".into(),
+            task_kind: None,
+            parent: None,
+            deadline_ms: None,
+            idempotency: None,
+        };
+        m.send_task(alice_task_1.clone()).await.unwrap();
+        m.send_task(alice_task_2.clone()).await.unwrap();
+        m.send_task(dan_task.clone()).await.unwrap();
+
+        // Results land in interleaved order — alice, dan, alice.
+        m.send_result(A2ATaskResult::ok(alice_task_1.id, vec![]))
+            .await
+            .unwrap();
+        m.send_result(A2ATaskResult::ok(dan_task.id, vec![]))
+            .await
+            .unwrap();
+        m.send_result(A2ATaskResult::ok(alice_task_2.id, vec![]))
+            .await
+            .unwrap();
+
+        // Alice drains hers first-then-second; Dan's stays.
+        let first = m.try_recv_result_for(&alice).await.unwrap().unwrap();
+        assert_eq!(first.task_id, alice_task_1.id);
+        let second = m.try_recv_result_for(&alice).await.unwrap().unwrap();
+        assert_eq!(second.task_id, alice_task_2.id);
+        assert!(m.try_recv_result_for(&alice).await.unwrap().is_none());
+
+        // Dan drains his.
+        let dans = m.try_recv_result_for(&dan).await.unwrap().unwrap();
+        assert_eq!(dans.task_id, dan_task.id);
+    }
+
+    #[tokio::test]
+    async fn try_recv_result_for_skips_results_for_unknown_task_ids() {
+        // Defence-in-depth: a result whose `task_id` is not in the senders
+        // map (replay corruption / out-of-band write) is invisible to
+        // every peer. The Sprint-43 audit-and-reject path covers `post`;
+        // this covers `recv`.
+        let m = InMemoryMailbox::new();
+        let alice = dummy_agent("alice@local");
+        m.send_result(A2ATaskResult::ok(Uuid::new_v4(), vec![]))
+            .await
+            .unwrap();
+        assert!(m.try_recv_result_for(&alice).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_compact_returns_zero() {
+        let m = InMemoryMailbox::new();
+        m.send_task(dummy_task()).await.unwrap();
+        assert_eq!(m.compact().await.unwrap(), 0);
+    }
+
+    fn task_between(sender: AgentId, recipient: AgentId) -> A2ATask {
+        A2ATask {
+            id: Uuid::new_v4(),
+            sender,
+            recipient,
+            intent_text: "x".into(),
+            task_kind: None,
+            parent: None,
+            deadline_ms: None,
+            idempotency: None,
+        }
+    }
+
+    async fn drive_round_trip(m: &JsonlMailbox, t: &A2ATask) {
+        m.send_task(t.clone()).await.unwrap();
+        let _ = m.try_recv_task_for(&t.recipient).await.unwrap().unwrap();
+        m.send_result(A2ATaskResult::ok(t.id, vec![]))
+            .await
+            .unwrap();
+        let _ = m.try_recv_result_for(&t.sender).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn jsonl_compact_drops_fully_resolved_task_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let m = JsonlMailbox::open(path.clone()).await.unwrap();
+
+        let alice = dummy_agent("alice@local");
+        let bob = dummy_agent("bob@local");
+        let t = task_between(alice.clone(), bob.clone());
+        drive_round_trip(&m, &t).await;
+
+        // Pre-compact: 4 events on disk (TaskSent, TaskRecv, ResultPosted, ResultRecv).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let count = raw.lines().filter(|l| !l.is_empty()).count();
+        assert_eq!(count, 4);
+
+        let dropped = m.compact().await.unwrap();
+        assert_eq!(dropped, 4);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.lines().find(|l| !l.is_empty()).is_none());
+
+        // Reopen — should yield empty in-memory state because every event
+        // was for the now-resolved task.
+        let m2 = JsonlMailbox::open(path).await.unwrap();
+        assert!(m2.recent_tasks(10).await.unwrap().is_empty());
+        assert!(m2.recent_results(10).await.unwrap().is_empty());
+        assert!(m2.lookup_task_sender(t.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn jsonl_compact_keeps_in_flight_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let m = JsonlMailbox::open(path.clone()).await.unwrap();
+
+        let alice = dummy_agent("alice@local");
+        let bob = dummy_agent("bob@local");
+        let carol = dummy_agent("carol@local");
+        // Three recipients so each task drains independently when its
+        // recipient asks for it. Otherwise `try_recv_task_for(bob)` on a
+        // shared recipient queue would always drain the oldest match.
+        let resolved = task_between(alice.clone(), bob.clone());
+        let in_flight = task_between(alice.clone(), bob.clone());
+        let no_result_yet = task_between(alice.clone(), carol.clone());
+
+        drive_round_trip(&m, &resolved).await;
+        // in_flight: send only — never drained.
+        m.send_task(in_flight.clone()).await.unwrap();
+        // no_result_yet: send + recv (different recipient so the drain
+        // doesn't fight in_flight) but no result posted yet.
+        m.send_task(no_result_yet.clone()).await.unwrap();
+        let _ = m.try_recv_task_for(&carol).await.unwrap().unwrap();
+
+        let dropped = m.compact().await.unwrap();
+        assert_eq!(
+            dropped, 4,
+            "only the four events for the resolved task drop"
+        );
+
+        // Reopen — both in-flight tasks survive in their respective
+        // states. `in_flight` is still a queued task; `no_result_yet`'s
+        // task was drained, but its sender entry is still required so
+        // a future `post_a2a_result` for it can be attributed.
+        let m2 = JsonlMailbox::open(path).await.unwrap();
+        let queued = m2.recent_tasks(10).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, in_flight.id);
+        assert_eq!(
+            m2.lookup_task_sender(no_result_yet.id).await.unwrap(),
+            Some(alice.clone()),
+            "drained-but-no-result task keeps its sender entry"
+        );
+        assert!(m2.lookup_task_sender(resolved.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn jsonl_compact_no_op_when_nothing_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let m = JsonlMailbox::open(path.clone()).await.unwrap();
+
+        // Two queued tasks, one drained-but-no-result task. None are
+        // fully resolved, so the compact call must be a no-op.
+        m.send_task(task_between(
+            dummy_agent("alice@local"),
+            dummy_agent("bob@local"),
+        ))
+        .await
+        .unwrap();
+        let drained = task_between(dummy_agent("alice@local"), dummy_agent("bob@local"));
+        m.send_task(drained.clone()).await.unwrap();
+        let _ = m
+            .try_recv_task_for(&drained.recipient)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let raw_before = std::fs::read_to_string(&path).unwrap();
+        let dropped = m.compact().await.unwrap();
+        assert_eq!(dropped, 0);
+        let raw_after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw_before, raw_after,
+            "no-op compact must not touch the file"
+        );
+        assert!(!path.with_extension("jsonl.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn jsonl_compact_replay_yields_same_state_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+
+        let alice = dummy_agent("alice@local");
+        let bob = dummy_agent("bob@local");
+        let resolved = task_between(alice.clone(), bob.clone());
+        let queued = task_between(alice.clone(), bob.clone());
+
+        let snapshot_pre = {
+            let m = JsonlMailbox::open(path.clone()).await.unwrap();
+            drive_round_trip(&m, &resolved).await;
+            m.send_task(queued.clone()).await.unwrap();
+            (
+                m.recent_tasks(10).await.unwrap(),
+                m.recent_results(10).await.unwrap(),
+                m.lookup_task_sender(queued.id).await.unwrap(),
+            )
+        };
+
+        // Compact in a fresh handle so the test is realistic — the
+        // operator triggers compaction on a running daemon.
+        let m_compact = JsonlMailbox::open(path.clone()).await.unwrap();
+        m_compact.compact().await.unwrap();
+
+        // Reopen and confirm the in-memory state matches.
+        let m_post = JsonlMailbox::open(path).await.unwrap();
+        let snapshot_post = (
+            m_post.recent_tasks(10).await.unwrap(),
+            m_post.recent_results(10).await.unwrap(),
+            m_post.lookup_task_sender(queued.id).await.unwrap(),
+        );
+        assert_eq!(snapshot_pre, snapshot_post);
+    }
+
+    #[tokio::test]
+    async fn jsonl_compact_does_not_drop_results_with_unposted_tasks() {
+        // Defence-in-depth: a `ResultPosted` whose `task_id` was never
+        // `TaskSent` is a corruption signal. The compact logic uses
+        // `seen` (TaskSent membership) as the gate, so an orphaned
+        // result is not droppable — it survives and can be inspected.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let m = JsonlMailbox::open(path.clone()).await.unwrap();
+
+        let orphan_task_id = Uuid::new_v4();
+        m.send_result(A2ATaskResult::ok(orphan_task_id, vec![]))
+            .await
+            .unwrap();
+
+        let dropped = m.compact().await.unwrap();
+        assert_eq!(dropped, 0);
+
+        // Surviving event still on disk and still replays.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(&orphan_task_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn jsonl_compact_drops_idempotency_cache_for_drained_source() {
+        // Memory regression guard: result_cache used to grow forever
+        // because IdempotencyResultCached was never droppable. Compact
+        // must reclaim cache entries whose source task is fully
+        // drained, both on disk and in the in-memory mirror.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let m = JsonlMailbox::open(path.clone()).await.unwrap();
+
+        let alice = dummy_agent("alice@local");
+        let bob = dummy_agent("bob@local");
+        let mut t = task_between(alice.clone(), bob.clone());
+        t.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "research:agent-memory",
+        ));
+        drive_round_trip(&m, &t).await;
+
+        // Pre-compact: five events (TaskSent, TaskLeased, ResultPosted,
+        // IdempotencyResultCached, ResultRecv).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let count = raw.lines().filter(|l| !l.is_empty()).count();
+        assert_eq!(count, 5);
+
+        let dropped = m.compact().await.unwrap();
+        assert_eq!(
+            dropped, 5,
+            "all five events drop, including the cache entry whose source task is drained"
+        );
+
+        // On-disk log is empty.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.lines().find(|l| !l.is_empty()).is_none());
+
+        // Reopen — a duplicate idempotency send must queue (cache miss)
+        // rather than replay, proving the in-memory cache was pruned
+        // alongside the on-disk event.
+        let reopened = JsonlMailbox::open(path).await.unwrap();
+        let mut duplicate = t.clone();
+        duplicate.id = Uuid::new_v4();
+        reopened.send_task(duplicate.clone()).await.unwrap();
+
+        assert!(
+            reopened
+                .try_recv_result_for(&duplicate.sender)
+                .await
+                .unwrap()
+                .is_none(),
+            "no cached replay after compact pruned the cache"
+        );
+        let queued = reopened
+            .try_recv_task_for(&duplicate.recipient)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued.map(|q| q.id),
+            Some(duplicate.id),
+            "duplicate falls through to the task queue once the cache is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_compact_propagates_non_notfound_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let m = JsonlMailbox::open(path.clone()).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = m.compact().await.unwrap_err();
+        assert!(
+            matches!(err, A2AError::Io(_)),
+            "compact must propagate a non-NotFound read fault as A2AError::Io, not \
+             collapse it into the NotFound -> Ok(0) arm that only a genuinely missing \
+             mailbox log may take; swallowing a read fault would silently no-op \
+             compaction and hide a corrupted or replaced mailbox path, letting the \
+             durable task-handoff log grow unbounded while operators read dropped=0 \
+             as an empty pre-cutoff window: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_compact_drops_drained_task_state_and_cache() {
+        // Real InMemoryMailbox compaction: every long-running daemon
+        // backed by this mailbox used to retain senders, attempts, and
+        // result_cache entries forever. compact() now reclaims state
+        // for tasks that are no longer queued, in-flight, or
+        // result-pending.
+        let m = InMemoryMailbox::new();
+
+        let alice = dummy_agent("alice@local");
+        let bob = dummy_agent("bob@local");
+        let mut t = task_between(alice.clone(), bob.clone());
+        t.idempotency = Some(A2AIdempotency::new(
+            A2ADuplicateSafety::Idempotent,
+            "research:agent-memory",
+        ));
+
+        m.send_task(t.clone()).await.unwrap();
+        let _ = m.try_recv_task_for(&t.recipient).await.unwrap().unwrap();
+        m.send_result(A2ATaskResult::ok(
+            t.id,
+            vec![Content::text("cached answer")],
+        ))
+        .await
+        .unwrap();
+        let _ = m.try_recv_result_for(&t.sender).await.unwrap().unwrap();
+
+        // Sender entry exists before compact, gets dropped after.
+        assert_eq!(
+            m.lookup_task_sender(t.id).await.unwrap(),
+            Some(alice.clone()),
+        );
+        assert_eq!(m.compact().await.unwrap(), 1);
+        assert!(m.lookup_task_sender(t.id).await.unwrap().is_none());
+
+        // A second task with the same idempotency key now queues —
+        // cache was pruned alongside the drained source task.
+        let mut duplicate = t.clone();
+        duplicate.id = Uuid::new_v4();
+        m.send_task(duplicate.clone()).await.unwrap();
+        let queued = m.try_recv_task_for(&duplicate.recipient).await.unwrap();
+        assert_eq!(
+            queued.map(|q| q.id),
+            Some(duplicate.id),
+            "duplicate must reach the task queue once the cache is pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_compact_preserves_unfinished_tasks() {
+        // A second compact-time invariant: tasks that are queued or
+        // in-flight or have a pending undelivered result are NOT
+        // droppable. Distinct recipients so try_recv_task_for picks
+        // up the specific task we want to lease.
+        let m = InMemoryMailbox::new();
+
+        let alice = dummy_agent("alice@local");
+        let bob = dummy_agent("bob@local");
+        let carol = dummy_agent("carol@local");
+        let dave = dummy_agent("dave@local");
+        let queued = task_between(alice.clone(), bob.clone());
+        let in_flight = task_between(alice.clone(), carol.clone());
+        let result_pending = task_between(alice.clone(), dave.clone());
+
+        m.send_task(queued.clone()).await.unwrap();
+        m.send_task(in_flight.clone()).await.unwrap();
+        m.send_task(result_pending.clone()).await.unwrap();
+
+        let _ = m
+            .try_recv_task_for(&in_flight.recipient)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = m
+            .try_recv_task_for(&result_pending.recipient)
+            .await
+            .unwrap()
+            .unwrap();
+        m.send_result(A2ATaskResult::ok(result_pending.id, vec![]))
+            .await
+            .unwrap();
+
+        assert_eq!(m.compact().await.unwrap(), 0);
+
+        assert_eq!(
+            m.lookup_task_sender(queued.id).await.unwrap(),
+            Some(alice.clone()),
+        );
+        assert_eq!(
+            m.lookup_task_sender(in_flight.id).await.unwrap(),
+            Some(alice.clone()),
+        );
+        assert_eq!(
+            m.lookup_task_sender(result_pending.id).await.unwrap(),
+            Some(alice.clone()),
+        );
+    }
+}

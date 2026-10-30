@@ -1,0 +1,258 @@
+//! Live integration test: spawns norend against a tempdir HOME and drives
+//! `Request::RevokeCapability` over the raw IPC socket — confirming the grant,
+//! active row, first revoke, idempotent second revoke, and drained ledger, and
+//! pinning the two signature-decode rejections that fire before any capability
+//! or ownership gate (wrong-length and non-base58 `signature_b58`).
+//!
+//! The verb is covered today over the CLI (`live_cli_capabilities_revoke.rs`,
+//! `live_cli_capabilities_revoke_json.rs`) but never over the raw Unix socket
+//! both are built on. This pins that wire contract: `Response::CapabilityRevoked
+//! { signature_b58, removed }` (noren-ipc/src/lib.rs:835) and the
+//! already-revoked branch that reports `removed = false` on a repeat
+//! (norend/src/lib.rs:6498).
+//!
+//! Seeded over the socket via `GrantCapability`; assertions key off the granted
+//! `signature_b58` only, so no identity derivation is needed (the operator
+//! stream's peer is the granting subject). Hermetic — no external services.
+//! `#[ignore]`'d. Run with
+//! `cargo test -p norend --test live_ipc_revoke_capability -- --ignored live_`.
+
+use noren_ipc::{read_frame, write_frame, Request, Response};
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::net::UnixStream;
+use tokio::process::{Child, Command};
+use tokio::time::sleep;
+
+fn pick_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    listener.local_addr().unwrap().port()
+}
+
+async fn wait_for_sock(path: &Path) -> bool {
+    for _ in 0..100 {
+        if path.exists() {
+            return true;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+async fn read_operator_token(home: &Path) -> String {
+    let path = home.join("peers").join("operator.token");
+    for _ in 0..50 {
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("operator token never appeared at {}", path.display());
+}
+
+async fn spawn_daemon(home: &Path) -> Child {
+    let port = pick_free_port();
+    let exe = env!("CARGO_BIN_EXE_norend");
+    let child = Command::new(exe)
+        .env("NOREN_HOME", home)
+        .env("NOREN_HTTP_PORT", port.to_string())
+        .env("HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn norend");
+    if !wait_for_sock(&home.join("sock")).await {
+        panic!("daemon never created its socket");
+    }
+    child
+}
+
+async fn req(stream: &mut UnixStream, request: Request) -> Response {
+    write_frame(stream, &request).await.expect("write_frame");
+    read_frame(stream).await.expect("read_frame")
+}
+
+async fn authenticated_stream(home: &Path) -> UnixStream {
+    let mut stream = UnixStream::connect(home.join("sock"))
+        .await
+        .expect("connect socket");
+    let token = read_operator_token(home).await;
+    match req(&mut stream, Request::Authenticate { token_b58: token }).await {
+        Response::Authenticated { .. } => {}
+        other => panic!("authenticate failed: {other:?}"),
+    }
+    stream
+}
+
+#[tokio::test]
+#[ignore = "live: spawns norend + drives Request::RevokeCapability over the socket after a grant"]
+async fn live_ipc_revoke_capability_round_trip() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut child = spawn_daemon(home.path()).await;
+    let mut stream = authenticated_stream(home.path()).await;
+
+    // Seed one capability and capture its signature.
+    let signature_b58 = match req(
+        &mut stream,
+        Request::GrantCapability {
+            action: "tool.call.echo".into(),
+            scope: None,
+            expires_at: None,
+        },
+    )
+    .await
+    {
+        Response::CapabilityGranted { signature_b58, .. } => signature_b58,
+        other => panic!("expected Response::CapabilityGranted, got {other:?}"),
+    };
+
+    // Baseline: the grant is live in the ledger.
+    match req(&mut stream, Request::RecentCapabilities { limit: 100 }).await {
+        Response::Capabilities { capabilities } => {
+            assert_eq!(
+                capabilities.len(),
+                1,
+                "the seeded grant must surface one row: {capabilities:?}"
+            );
+            assert_eq!(
+                bs58::encode(capabilities[0].signature).into_string(),
+                signature_b58,
+                "the listed capability must be the one granted"
+            );
+        }
+        other => panic!("expected Response::Capabilities, got {other:?}"),
+    }
+
+    // First revoke removes the operator's own capability.
+    match req(
+        &mut stream,
+        Request::RevokeCapability {
+            signature_b58: signature_b58.clone(),
+        },
+    )
+    .await
+    {
+        Response::CapabilityRevoked {
+            signature_b58: echoed,
+            removed,
+        } => {
+            assert_eq!(
+                echoed, signature_b58,
+                "the response must echo the revoked signature"
+            );
+            assert!(
+                removed,
+                "the operator's own capability must be removed on first revoke"
+            );
+        }
+        other => panic!("expected Response::CapabilityRevoked, got {other:?}"),
+    }
+
+    // The idempotent second revoke finds nothing to remove.
+    match req(
+        &mut stream,
+        Request::RevokeCapability {
+            signature_b58: signature_b58.clone(),
+        },
+    )
+    .await
+    {
+        Response::CapabilityRevoked {
+            signature_b58: echoed,
+            removed,
+        } => {
+            assert_eq!(echoed, signature_b58);
+            assert!(
+                !removed,
+                "a second revoke of the same signature must report removed=false"
+            );
+        }
+        other => panic!("expected Response::CapabilityRevoked, got {other:?}"),
+    }
+
+    // The revoked capability no longer lists as active.
+    match req(&mut stream, Request::RecentCapabilities { limit: 100 }).await {
+        Response::Capabilities { capabilities } => assert!(
+            capabilities
+                .iter()
+                .all(|c| bs58::encode(c.signature).into_string() != signature_b58),
+            "the revoked capability must not remain active: {capabilities:?}"
+        ),
+        other => panic!("expected Response::Capabilities, got {other:?}"),
+    }
+
+    drop(stream);
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+#[ignore = "live: asserts Request::RevokeCapability with a signature_b58 that decodes to != 64 bytes flattens onto Response::Error — the bs58 Ok-but-wrong-length arm, which the round-trip test bypasses by granting a real 64-byte cap"]
+async fn live_ipc_revoke_capability_rejects_wrong_length_signature() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut child = spawn_daemon(home.path()).await;
+    let mut stream = authenticated_stream(home.path()).await;
+
+    // 63 bytes decodes cleanly but is one short of the 64-byte ed25519
+    // signature the ownership lookup keys on. The decoded length is checked
+    // before any capability or ownership gate, so no grant is needed.
+    let wrong_len = bs58::encode(vec![1u8; 63]).into_string();
+    match req(
+        &mut stream,
+        Request::RevokeCapability {
+            signature_b58: wrong_len,
+        },
+    )
+    .await
+    {
+        Response::Error { message } => {
+            assert!(
+                message.contains("signature must decode to 64 bytes"),
+                "wrong-length signature must hit the length bail, got: {message}"
+            );
+        }
+        other => panic!("expected Response::Error for wrong-length signature, got {other:?}"),
+    }
+
+    drop(stream);
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[tokio::test]
+#[ignore = "live: asserts Request::RevokeCapability with a non-base58 signature_b58 flattens onto Response::Error — the bs58::decode Err arm, distinct from the wrong-length arm"]
+async fn live_ipc_revoke_capability_rejects_malformed_signature_b58() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut child = spawn_daemon(home.path()).await;
+    let mut stream = authenticated_stream(home.path()).await;
+
+    // `-` and space sit outside every base58 alphabet, so bs58::decode Errs
+    // before the 64-byte length check. The decode runs first, so no grant is
+    // needed.
+    match req(
+        &mut stream,
+        Request::RevokeCapability {
+            signature_b58: "not base58!".to_string(),
+        },
+    )
+    .await
+    {
+        Response::Error { message } => {
+            assert!(
+                message.contains("invalid base58 signature"),
+                "non-base58 signature must hit the decode-Err bail, got: {message}"
+            );
+        }
+        other => panic!("expected Response::Error for malformed signature_b58, got {other:?}"),
+    }
+
+    drop(stream);
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}

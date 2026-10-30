@@ -1,0 +1,45 @@
+# Noren
+
+> Noren is an open, local-first, agent-native operating layer. It runs as a local daemon on the host and exposes eight operating-layer primitives (intent, runtime, memory, identity, permissions, comms, compositor, and settlement) through which human users, software agents, and tools coordinate work, share state, and account for resource usage. License Apache-2.0. Version 0.1.0-alpha.1.
+
+Noren sits between the host OS and agentic applications. Agents are package directories with an agent.toml manifest; permissions are ed25519-signed capability tokens; every state change is appended to a hash-linked audit log; resource usage produces local settlement receipts. The canonical vocabulary is: intent, agent, capability, memory record, audit event, settlement receipt.
+
+## Docs
+
+- [FAQ](https://usenoren.xyz/faq): Short answers to common questions (what Noren is, how it differs from MCP, whether it needs a blockchain, the eight primitives, and its pre-1.0 status).
+- [Overview](https://docs.usenoren.xyz/): What Noren is and where it sits in the stack.
+- [Getting started](https://docs.usenoren.xyz/getting-started): Build from source, run the daemon, dispatch a first intent.
+- [Concepts](https://docs.usenoren.xyz/concepts): The data model: intents, agents, capabilities, memory, audit, settlement.
+- [The eight primitives](https://docs.usenoren.xyz/primitives): Definitions of all eight host-level primitives.
+- [Glossary](https://docs.usenoren.xyz/glossary): Canonical one-line definitions of the eight primitives and core artifacts.
+- [System architecture](https://docs.usenoren.xyz/architecture): Daemon, runtime, local control plane, settlement scaffold.
+- [CLI reference](https://docs.usenoren.xyz/cli): Every noren subcommand.
+- [HTTP API](https://docs.usenoren.xyz/http-api): Local gateway routes and schemas.
+- [Agent manifest](https://docs.usenoren.xyz/agent-manifest): Full agent.toml schema and validation.
+- [Capability tokens](https://docs.usenoren.xyz/capabilities): ed25519 permission token structure, encoding, verification, revocation.
+- [Security model](https://docs.usenoren.xyz/security): Trust boundaries, threat model, defaults.
+
+## Protocols
+
+- [MCP integration](https://docs.usenoren.xyz/mcp): Tool trait and external MCP servers over JSON-RPC.
+- [Agent-to-agent](https://docs.usenoren.xyz/a2a): A2A transport.
+- [Settlement](https://docs.usenoren.xyz/settlement): Local receipt model and the on-chain scaffold.
+
+## Source
+
+Source repository: coming soon. Noren is built on open-source Noren (Apache-2.0): https://usenoren.xyz/about#credits
+
+## Optional
+
+- [Autonomous workflow](https://docs.usenoren.xyz/autonomy)
+- [Validation profile](https://docs.usenoren.xyz/validation)
+- [Alpha release contract](https://docs.usenoren.xyz/alpha-release)
+- [A2A idempotency](https://docs.usenoren.xyz/a2a-idempotency)
+- [Audit log](https://docs.usenoren.xyz/audit)
+- [Audit integrity](https://docs.usenoren.xyz/audit-integrity)
+- [Identity and keys](https://docs.usenoren.xyz/identity)
+- [Memory tiers](https://docs.usenoren.xyz/memory)
+- [Local IPC](https://docs.usenoren.xyz/ipc)
+- [Live coverage](https://docs.usenoren.xyz/live-coverage)
+- [Linux gVisor runner](https://docs.usenoren.xyz/gvisor-live-runner)
+- [Provenance](https://docs.usenoren.xyz/provenance)

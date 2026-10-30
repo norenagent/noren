@@ -1,0 +1,16 @@
+{
+  "name": "noren",
+  "owner": { "name": "Noren" },
+  "description": "Noren plugins for Claude Code.",
+  "version": "0.1.0",
+  "plugins": [
+    {
+      "name": "noren-guard",
+      "source": "./plugins/noren-guard",
+      "description": "Run Claude Code unattended: capped spend, sandboxed execution, signed receipt, enforced from outside the agent's process.",
+      "version": "0.1.0",
+      "category": "security",
+      "keywords": ["unattended", "spend-cap", "sandbox", "receipt", "overnight"]
+    }
+  ]
+}

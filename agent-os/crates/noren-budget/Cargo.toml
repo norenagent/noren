@@ -1,0 +1,25 @@
+[package]
+name = "noren-budget"
+version = "0.1.0"
+description = "Per-agent token-bucket ledger backing `Settlement.budget_credits_per_hour` (manifest §5). Async trait with in-memory and JSONL-backed event-log implementations, a separate pause/resume checkpoint store so replay cannot charge the same work twice, and bounded compaction that emits per-agent Snapshot events at the cutoff."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+noren-types = { path = "../noren-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+# `cfg(kani)` is set only under `cargo kani`; register it so a normal
+# build/clippy run doesn't flag the proof module as an unexpected cfg.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

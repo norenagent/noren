@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Repo-local pre-commit hook. Two responsibilities:
+#
+#   1. Enforce one-autonomous-session-per-checkout via session-id lock.
+#   2. Enforce the repo-owned Git identity and staged local-leak guards.
+#
+# Activated by `git config core.hooksPath hooks` at the repo root.
+# scripts/handover.sh calls that config command idempotently at every
+# spawn, so a fresh clone gets the hook the first time the autonomous
+# loop runs handover.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+if [ -f agent-os/scripts/validate-current-git-identity.mjs ]; then
+  node agent-os/scripts/validate-current-git-identity.mjs
+fi
+
+# --- Session lock ---
+#
+# When NOREN_SESSION_ID is set in env (autonomous session spawned by
+# scripts/handover.sh), it must match `.noren-session-id` at the repo
+# root. Mismatch means a parallel session has taken over — refuse the
+# commit and ask the older session to exit.
+#
+# When NOREN_SESSION_ID is unset, treat the commit as operator-driven
+# (manual cleanup, dependabot tweak, etc.) and skip the check entirely.
+
+if [ -n "${NOREN_SESSION_ID:-}" ]; then
+  LOCK_PATH="$REPO_ROOT/.noren-session-id"
+
+  if [ ! -f "$LOCK_PATH" ]; then
+    echo "noren pre-commit: NOREN_SESSION_ID set but $LOCK_PATH does not exist." >&2
+    echo "  Run scripts/bootstrap-session.sh once to write the lock," >&2
+    echo "  or unset NOREN_SESSION_ID for an operator-mode commit." >&2
+    exit 1
+  fi
+
+  ACTUAL="$(tr -d '[:space:]' <"$LOCK_PATH")"
+  if [ "${NOREN_SESSION_ID}" != "$ACTUAL" ]; then
+    echo "noren pre-commit: session-id mismatch — another session has taken over." >&2
+    echo "  this session: ${NOREN_SESSION_ID}" >&2
+    echo "  active session: $ACTUAL" >&2
+    echo "  Exit and let the active session continue (one-session-per-checkout rule)." >&2
+    echo "  Operator escape: unset NOREN_SESSION_ID, or remove $LOCK_PATH if no session is active." >&2
+    exit 1
+  fi
+fi
+
+# --- Staged local-leak scan ---
+#
+# Discovers identifying tokens (USER, HOME, hostname variants, global git
+# identity) from the environment and refuses commits that contain them in
+# staged file paths or added diff lines. Tokens shorter than 4 chars are
+# dropped to avoid false positives against generic words like "ci" or
+# "node".
+
+tokens=()
+[ -n "${USER:-}" ] && tokens+=("$USER")
+[ -n "${HOME:-}" ] && tokens+=("$HOME")
+
+hostname_cmds=(
+  "hostname"
+  "hostname -s"
+  "scutil --get LocalHostName"
+  "scutil --get ComputerName"
+)
+for cmd in "${hostname_cmds[@]}"; do
+  read -r -a parts <<<"$cmd"
+  h=$("${parts[@]}" 2>/dev/null || true)
+  [ -n "$h" ] && [ "$h" != "localhost" ] && tokens+=("$h")
+done
+
+gname=$(git config --global --get user.name 2>/dev/null || true)
+gemail=$(git config --global --get user.email 2>/dev/null || true)
+[ -n "$gname" ] && tokens+=("$gname")
+[ -n "$gemail" ] && tokens+=("$gemail")
+
+unique=()
+for t in "${tokens[@]:-}"; do
+  [ -z "$t" ] && continue
+  [ "${#t}" -lt 4 ] && continue
+  case "$t" in
+    root|node|user|home|admin|guest|local) continue ;;
+  esac
+  skip=0
+  for u in "${unique[@]:-}"; do
+    [ "$t" = "$u" ] && skip=1 && break
+  done
+  [ "$skip" = 0 ] && unique+=("$t")
+done
+
+staged_files=$(git diff --cached --name-only)
+staged_added=$(git diff --cached --no-color -U0 | grep -E '^\+[^+]' || true)
+
+violations=0
+for tok in "${unique[@]:-}"; do
+  [ -z "$tok" ] && continue
+
+  if echo "$staged_files" | grep -F -- "$tok" >/dev/null 2>&1; then
+    {
+      echo "noren pre-commit: leak detected in staged file path."
+      echo "$staged_files" | grep -F -- "$tok" | sed 's/^/  /'
+    } >&2
+    violations=$((violations + 1))
+  fi
+
+  if [ -n "$staged_added" ] && echo "$staged_added" | grep -F -- "$tok" >/dev/null 2>&1; then
+    echo "noren pre-commit: leak detected in staged additions." >&2
+    git diff --cached --name-only | while read -r f; do
+      [ -z "$f" ] && continue
+      if git diff --cached --no-color -U0 -- "$f" 2>/dev/null | grep -E '^\+[^+]' | grep -F -- "$tok" >/dev/null 2>&1; then
+        echo "  $f" >&2
+      fi
+    done
+    violations=$((violations + 1))
+  fi
+done
+
+if [ "$violations" -gt 0 ]; then
+  echo "noren pre-commit: aborting. Redact the listed tokens and re-stage." >&2
+  exit 2
+fi
+
+exit 0

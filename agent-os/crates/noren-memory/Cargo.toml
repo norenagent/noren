@@ -1,0 +1,23 @@
+[package]
+name = "noren-memory"
+version = "0.1.0"
+description = "Three-tier memory store (working, episodic, long-term) for Noren. SQLite-backed persistence with an in-memory backend for tests, cosine similarity search over stored vectors, tier-scoped purge, bounded compaction, and scoped repair commands."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+noren-types = { path = "../noren-types" }
+async-trait = { workspace = true }
+bs58 = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,28 @@
+{
+  "name": "Noren",
+  "description": "Open, local-first OS for autonomous agents. Scoped capabilities, hash-chained audit log, x402 settlement in USDG. Robinhood Chain support coming soon.",
+  "image": "https://usenoren.xyz/noren-mark.png",
+  "website": "https://usenoren.xyz",
+  "twitter": "@Noren",
+  "capabilities": [
+    "agent_identity",
+    "audit_anchor",
+    "x402_payments",
+    "capability_scopes",
+    "settlement"
+  ],
+  "skills": [
+    "noren.skill.tx.v2",
+    "x402.seller",
+    "x402.buyer",
+    "audit.anchor",
+    "permission.scope"
+  ],
+  "serviceTypes": [
+    "AGENT",
+    "WEB"
+  ],
+  "verified": false,
+  "registrationSource": "noren-said-bridge",
+  "chain": "robinhood-4663"
+}

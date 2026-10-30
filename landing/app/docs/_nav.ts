@@ -1,0 +1,68 @@
+export type DocsLink = { href: string; label: string };
+export type DocsSection = { title: string; items: DocsLink[] };
+
+export const DOCS_NAV: DocsSection[] = [
+  {
+    title: "Introduction",
+    items: [
+      { href: "/", label: "Overview" },
+      { href: "/getting-started", label: "Getting started" },
+      { href: "/agent-quickstart", label: "Agent quickstart" },
+      { href: "/concepts", label: "Concepts" },
+      { href: "/autonomy", label: "Autonomous workflow" },
+      { href: "/validation", label: "Validation profile" },
+      { href: "/alpha-release", label: "Alpha release" },
+    ],
+  },
+  {
+    title: "Architecture",
+    items: [
+      { href: "/architecture", label: "System architecture" },
+      { href: "/primitives", label: "The eight primitives" },
+      { href: "/multichain", label: "Robinhood Chain" },
+      { href: "/glossary", label: "Glossary" },
+    ],
+  },
+  {
+    title: "Reference",
+    items: [
+      { href: "/cli", label: "Command-line interface" },
+      { href: "/http-api", label: "HTTP API" },
+      { href: "/ipc", label: "Local IPC" },
+      { href: "/agent-manifest", label: "Agent manifest" },
+    ],
+  },
+  {
+    title: "Protocols",
+    items: [
+      { href: "/capabilities", label: "Capability tokens" },
+      { href: "/mcp", label: "MCP integration" },
+      { href: "/a2a", label: "Agent-to-agent" },
+      { href: "/a2a-idempotency", label: "A2A idempotency policy" },
+      { href: "/audit", label: "Audit log" },
+      { href: "/audit-integrity", label: "Audit integrity" },
+      { href: "/conformance", label: "Conformance" },
+      { href: "/settlement", label: "Settlement" },
+      { href: "/compute", label: "Compute" },
+    ],
+  },
+  {
+    title: "Integrations",
+    items: [
+      { href: "/build-with-x402", label: "Build with x402" },
+      { href: "/x402", label: "x402 payments" },
+      { href: "/zauth", label: "zauth provider hub" },
+    ],
+  },
+  {
+    title: "Operations",
+    items: [
+      { href: "/security", label: "Security model" },
+      { href: "/identity", label: "Identity and keys" },
+      { href: "/memory", label: "Memory tiers" },
+      { href: "/live-coverage", label: "Live coverage" },
+      { href: "/gvisor-live-runner", label: "Linux gVisor runner" },
+      { href: "/provenance", label: "Provenance" },
+    ],
+  },
+];

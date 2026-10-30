@@ -1,0 +1,22 @@
+[package]
+name = "noren-audit"
+version = "0.1.0"
+description = "Append-only audit log for Noren. `AuditLog` trait with JSONL and in-memory backends, per-event hash-chain integrity verification surfaced via `verify_integrity`, and recorded event kinds spanning intent dispatch, capability checks/grants/rejections, budget enforcement, agent-to-agent messaging, tool approval and invocation, memory maintenance, peer and operator administration, and authentication failures."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+noren-types = { path = "../noren-types" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

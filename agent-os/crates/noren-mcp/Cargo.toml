@@ -1,0 +1,22 @@
+[package]
+name = "noren-mcp"
+version = "0.1.0"
+description = "Model Context Protocol (MCP) integration for Noren. Tool trait following the public MCP wire shapes (name, description, inputSchema, Content blocks, isError) so the same trait backs native Rust implementations and external MCP servers, in-process registry, native tools, and stdio JSON-RPC 2.0 transport for external MCP servers."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "noren-mcp-fake-server"
+path = "src/bin/fake_server.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }

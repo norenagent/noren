@@ -1,0 +1,22 @@
+#!/bin/sh
+# Noren web-starter workspace preset: scaffolds a tiny static site inside the
+# ephemeral /workspace, verifies it, and reports. No network, no host access.
+set -eu
+cd /workspace
+mkdir -p site
+cat > site/index.html <<'HTML'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Noren workspace</title>
+<link rel="stylesheet" href="style.css"></head>
+<body><main><h1>Built inside a Noren workspace</h1>
+<p>Written in an ephemeral, network-less container.</p></main></body></html>
+HTML
+cat > site/style.css <<'CSS'
+body{font-family:system-ui,sans-serif;background:#0b0b0c;color:#f4f4f5;margin:0}
+main{max-width:40rem;margin:4rem auto;padding:0 1.5rem}
+CSS
+echo "scaffold: ok"
+grep -q '<h1>' site/index.html && echo "check html: ok"
+grep -q 'max-width' site/style.css && echo "check css: ok"
+echo "files: $(find site -type f | wc -l)"
+echo "network: $(ls /sys/class/net | tr '\n' ' ')"

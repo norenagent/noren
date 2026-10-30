@@ -1,0 +1,22 @@
+[package]
+name = "noren-peer-auth"
+version = "0.1.0"
+description = "Peer-token registry for binding ipc/http callers to AgentIds. Per-agent random 32-byte tokens with 6-char b58 prefix-only operator visibility (full tokens never leave the daemon), jsonl-backed event log, revocation tombstones with prefix-based discovery, live/revoked/all status-filter queries, and an in-memory mock for tests."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+noren-types = { path = "../noren-types" }
+async-trait = { workspace = true }
+bs58 = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

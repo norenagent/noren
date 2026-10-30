@@ -1,0 +1,21 @@
+[package]
+name = "noren-settlement"
+version = "0.1.0"
+description = "Settlement primitive for Noren. Trait-based interface with in-memory and JSONL receipt stores implementing the credits-and-buyback settlement model: receipts accumulate in a local JSONL log until batched and flushed to the on-chain settlement program, at which point each receipt's onchain_sig is populated."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+noren-types = { path = "../noren-types" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

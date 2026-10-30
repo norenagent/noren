@@ -1,0 +1,15 @@
+{
+  "service": "Noren",
+  "description": "Noren x402 gateway for paid USDG APIs on Robinhood Chain.",
+  "site": "https://usenoren.xyz",
+  "gateway": "https://gateway.usenoren.xyz",
+  "network": "eip155:4663",
+  "asset": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+  "attestationKey": {
+    "alg": "ed25519",
+    "chain": "robinhood-4663",
+    "publicKey": "coming soon",
+    "use": "Noren on-chain audit attestation key; not published yet.",
+    "verify": "Not available yet."
+  }
+}

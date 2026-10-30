@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: noren-ens-gateway
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    dockerfilePath: deploy/Dockerfile.ens-gateway
+    dockerContext: .
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: NOREN_ENS_GATEWAY_KEY_HEX
+        sync: false
+      - key: NOREN_ENS_RESOLVER
+        sync: false
+      - key: NOREN_ENS_NAMES
+        sync: false
+      - key: RUST_LOG
+        value: info

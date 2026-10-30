@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+  # crypto-bigint 0.5.5 arrives through k256 0.13 / elliptic-curve 0.13
+  # (the secp256k1 signer used for EIP-712 and EIP-3009). The fix needs the
+  # k256 0.14 line, which changes the signer API. Tracked; not yet upgraded.
+  "RUSTSEC-2026-0387",
+]

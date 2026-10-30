@@ -1,0 +1,13 @@
+packages:
+  - packages/config
+  - packages/ui
+  - landing
+  - services/proof-gen
+  - services/robinhood-mcp-bridge
+  - services/robinhood-guard-proxy
+  - services/hermes-mcp-bridge
+  - services/compute-broker
+  - services/coding-gateway
+  - apps/desk
+  - services/fairscale-bridge
+  - services/witness-verifier

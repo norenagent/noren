@@ -1,0 +1,16 @@
+[package]
+name = "noren-router"
+version = "0.1.0"
+description = "Intent router for Noren. Loads agent manifests from `$NOREN_HOME/agents/` and routes intents to registered agent capability cards via keyword-overlap matching."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+noren-manifest = { path = "../noren-manifest" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

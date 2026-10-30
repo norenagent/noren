@@ -1,0 +1,5 @@
+# Security policy. Direct channels are coming soon; use the contact form.
+Contact: https://usenoren.xyz/contact
+Expires: 2027-05-31T00:00:00.000Z
+Preferred-Languages: en
+Canonical: https://usenoren.xyz/.well-known/security.txt

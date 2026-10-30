@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+usage() {
+  cat <<'EOF'
+usage: scripts/validate.sh [--scripts] [--quick] [--live]
+
+  --scripts  run public repo guardrails without Rust tooling
+  --quick    run format, repo guards, cargo check, and cargo test
+  --live     run ignored live tests instead of the default mock suite
+EOF
+}
+
+mode="full"
+set_mode() {
+  local next="$1"
+  if [ "$mode" != "full" ] && [ "$mode" != "$next" ]; then
+    printf 'error: choose exactly one mode flag (--scripts, --quick, --live)\n' >&2
+    usage >&2
+    exit 2
+  fi
+  mode="$next"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --scripts) set_mode "scripts" ;;
+    --quick) set_mode "quick" ;;
+    --live) set_mode "live" ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+run() {
+  printf '>> %s\n' "$*"
+  "$@"
+}
+
+# Local-only validators are deliberately untracked (operator tooling); a clean
+# clone does not have them. Run when present, skip when absent — but a tracked
+# validator that has gone missing is a broken gate, not a skip.
+#
+# When a local-only validator is present but FAILS, warn instead of vetoing the
+# committed gate: CI never runs these, and an untracked checker can go stale
+# against code owned by another track (it pins expectations no commit in this
+# repo can update). The committed gate's exit code must be a function of
+# committed state only. Operators who want their local validators to hard-fail
+# can export NOREN_STRICT_LOCAL_VALIDATORS=1.
+run_local() {
+  if [ -f "$1" ]; then
+    printf '>> node %s (local-only)\n' "$1"
+    if ! node "$1"; then
+      if [ "${NOREN_STRICT_LOCAL_VALIDATORS:-0}" = "1" ]; then
+        printf 'local-only validator failed (NOREN_STRICT_LOCAL_VALIDATORS=1): %s\n' "$1" >&2
+        exit 1
+      fi
+      printf 'warning: local-only validator failed; not enforced for the committed gate: %s\n' "$1" >&2
+    fi
+  elif git ls-files --error-unmatch "$1" >/dev/null 2>&1; then
+    printf 'missing tracked validator: %s\n' "$1" >&2
+    exit 1
+  else
+    printf 'skip (local-only validator, not in this checkout): %s\n' "$1"
+  fi
+}
+
+if [ "$mode" != "scripts" ]; then
+  run cargo fmt --check
+fi
+
+run node ./scripts/provenance.mjs verify-all
+run node ./scripts/metrics.mjs
+run node ./scripts/conformance.mjs --check
+run node ./scripts/validate-cli-envelope-docs.mjs
+run node ./scripts/validate-chain-cli-envelope-fields.mjs
+run_local ./scripts/validate-sdk-compatibility.mjs
+run node ./scripts/validate-crate-groups-coverage.mjs
+run node ./scripts/validate-gvisor-required-check-deferral.mjs
+run node ./scripts/validate-gvisor-live-test-target.mjs
+run node ./scripts/validate-gvisor-live-runner-doc-contract.mjs
+run node ./scripts/validate-daemon-subprocess-recover-before-tick.mjs
+run node ./scripts/validate-budget-projection-env-doc.mjs
+run node ./scripts/validate-ipc-v2-migration-doc-fixtures.mjs
+run_local ./scripts/validate-autonomy-status-gaps.mjs
+run node ./scripts/validate-chain-tx-test-line-refs.mjs
+run node ./scripts/validate-receipt-list-line-refs.mjs
+run node ./scripts/validate-receipt-onchain-fallback-line-refs.mjs
+run node ./scripts/validate-memory-backfill-line-refs.mjs
+run node ./scripts/validate-settlement-backfill-line-refs.mjs
+run node ./scripts/validate-chain-status-line-refs.mjs
+run node ./scripts/validate-flush-receipts-line-refs.mjs
+run node ./scripts/validate-receipt-batch-list-line-refs.mjs
+run node ./scripts/validate-capabilities-purge-line-refs.mjs
+run node ./scripts/validate-peers-rotate-line-refs.mjs
+run node ./scripts/validate-peers-rotate-side-effect-comment-line-refs.mjs
+run node ./scripts/validate-ping-line-refs.mjs
+run node ./scripts/validate-tool-list-line-refs.mjs
+run node ./scripts/validate-tool-result-line-refs.mjs
+run node ./scripts/validate-capability-list-line-refs.mjs
+run node ./scripts/validate-capability-revoke-line-refs.mjs
+run node ./scripts/validate-intent-result-line-refs.mjs
+run node ./scripts/validate-peers-purge-line-refs.mjs
+run node ./scripts/validate-audit-recent-line-refs.mjs
+run node ./scripts/validate-audit-purge-line-refs.mjs
+run node ./scripts/validate-audit-verify-line-refs.mjs
+run node ./scripts/validate-memory-read-line-refs.mjs
+run node ./scripts/validate-memory-compaction-line-refs.mjs
+run node ./scripts/validate-memory-compact-dry-run-default-line-refs.mjs
+run node ./scripts/validate-capability-grant-line-refs.mjs
+run node ./scripts/validate-peer-revoke-line-refs.mjs
+run node ./scripts/validate-memory-purge-line-refs.mjs
+run node ./scripts/validate-memory-purge-record-count-print-line-refs.mjs
+run node ./scripts/validate-a2a-compact-line-refs.mjs
+run node ./scripts/validate-a2a-retry-line-refs.mjs
+run node ./scripts/validate-ignore-report-line-refs.mjs
+run node ./scripts/validate-bootstrap-result-line-refs.mjs
+run node ./scripts/validate-memory-compaction-plan-line-refs.mjs
+run node ./scripts/validate-a2a-status-line-refs.mjs
+run node ./scripts/validate-peer-list-line-refs.mjs
+run node ./scripts/validate-verify-report-line-refs.mjs
+run node ./scripts/validate-intents-resume-line-refs.mjs
+run node ./scripts/validate-intents-resume-sources-block-print-line-refs.mjs
+run node ./scripts/validate-sap-status-line-refs.mjs
+run node ./scripts/validate-sap-published-agent-line-refs.mjs
+run node ./scripts/validate-sap-published-audit-root-line-refs.mjs
+run node ./scripts/validate-sap-published-attestation-line-refs.mjs
+run node ./scripts/validate-noren-ipc-struct-line-refs.mjs
+run node ./scripts/validate-noren-ipc-field-attribute-range-line-refs.mjs
+run node ./scripts/validate-noren-ipc-chain-status-field-list-line-refs.mjs
+run node ./scripts/validate-noren-ipc-verify-check-field-list-line-refs.mjs
+run node ./scripts/validate-noren-ipc-verify-drift-field-list-line-refs.mjs
+run node ./scripts/validate-noren-ipc-receipt-batch-summary-field-list-line-refs.mjs
+run node ./scripts/validate-noren-peer-auth-struct-line-refs.mjs
+run node ./scripts/validate-noren-peer-auth-peer-summary-field-list-line-refs.mjs
+run node ./scripts/validate-noren-peer-auth-revoke-outcome-ambiguous-variant-range-line-refs.mjs
+run node ./scripts/validate-noren-peer-auth-revoke-outcome-enum-annotation-line-refs.mjs
+run node ./scripts/validate-noren-peer-auth-revoke-outcome-ambiguous-truncated-attribute-line-refs.mjs
+run node ./scripts/validate-noren-peer-auth-revoke-outcome-variant-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-struct-line-refs.mjs
+run node ./scripts/validate-noren-a2a-field-attribute-range-line-refs.mjs
+run node ./scripts/validate-noren-a2a-enum-block-range-line-refs.mjs
+run node ./scripts/validate-noren-a2a-struct-block-range-line-refs.mjs
+run node ./scripts/validate-noren-a2a-default-impl-block-range-line-refs.mjs
+run node ./scripts/validate-noren-a2a-task-result-error-fn-block-range-line-refs.mjs
+run node ./scripts/validate-noren-a2a-a2a-idempotency-field-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-task-queue-entry-field-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-task-field-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-task-result-field-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-auto-retry-report-field-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-auto-retry-policy-field-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-auto-retry-requeued-field-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-auto-retry-skipped-field-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-task-status-variant-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-task-queue-state-variant-list-line-refs.mjs
+run node ./scripts/validate-noren-a2a-auto-retry-skip-reason-variant-list-line-refs.mjs
+run node ./scripts/validate-noren-mcp-struct-line-refs.mjs
+run node ./scripts/validate-noren-mcp-tool-spec-annotation-line-refs.mjs
+run node ./scripts/validate-noren-mcp-tool-spec-field-list-line-refs.mjs
+run node ./scripts/validate-noren-mcp-content-enum-annotation-line-refs.mjs
+run node ./scripts/validate-noren-mcp-content-variant-list-line-refs.mjs
+run node ./scripts/validate-mcp-vendor-fixture-integrity.mjs
+run node ./scripts/validate-noren-audit-struct-line-refs.mjs
+run node ./scripts/validate-noren-audit-kind-annotation-line-refs.mjs
+run node ./scripts/validate-noren-audit-event-field-list-line-refs.mjs
+run node ./scripts/validate-noren-audit-integrity-report-field-list-line-refs.mjs
+run node ./scripts/validate-noren-types-struct-line-refs.mjs
+run node ./scripts/validate-noren-types-capability-field-list-line-refs.mjs
+run node ./scripts/validate-noren-types-memory-record-field-list-line-refs.mjs
+run node ./scripts/validate-noren-types-settlement-receipt-field-list-line-refs.mjs
+run node ./scripts/validate-noren-types-agent-id-serialize-impl-line-refs.mjs
+run node ./scripts/validate-noren-types-enum-serde-rename-annotation-line-refs.mjs
+run node ./scripts/validate-noren-types-field-attribute-range-line-refs.mjs
+run node ./scripts/validate-noren-types-enum-block-range-line-refs.mjs
+run node ./scripts/validate-noren-types-resource-kind-variant-list-line-refs.mjs
+run node ./scripts/validate-noren-types-memory-tier-variant-list-line-refs.mjs
+run node ./scripts/validate-noren-types-memory-repair-mode-variant-list-line-refs.mjs
+run node ./scripts/validate-noren-types-memory-compaction-outcome-field-list-line-refs.mjs
+run node ./scripts/validate-noren-types-tx-sig-doc-comment-range-line-refs.mjs
+run node ./scripts/validate-noren-permissions-struct-line-refs.mjs
+run node ./scripts/validate-noren-permissions-sig-b58-module-range-line-refs.mjs
+run node ./scripts/validate-noren-permissions-signed-capability-field-list-line-refs.mjs
+run node ./scripts/validate-norend-recent-capabilities-fn-block-range-line-refs.mjs
+run node ./scripts/validate-receipt-list-type-level-pin-line-refs.mjs
+run node ./scripts/validate-capability-list-type-level-pin-line-refs.mjs
+run node ./scripts/validate-capability-grant-type-level-pin-line-refs.mjs
+run node ./scripts/validate-capability-grant-expand-action-stderr-line-refs.mjs
+run node ./scripts/validate-peer-list-type-level-pin-line-refs.mjs
+run node ./scripts/validate-intent-result-type-level-pin-line-refs.mjs
+run node ./scripts/validate-intents-resume-type-level-pin-line-refs.mjs
+run node ./scripts/validate-memory-read-type-level-pin-line-refs.mjs
+run node ./scripts/validate-a2a-status-type-level-pin-line-refs.mjs
+run node ./scripts/validate-tool-result-type-level-pin-line-refs.mjs
+run node ./scripts/validate-ignore-report-type-level-pin-line-refs.mjs
+run node ./scripts/validate-audit-recent-type-level-pin-line-refs.mjs
+run node ./scripts/validate-audit-purge-type-level-pin-line-refs.mjs
+run node ./scripts/validate-memory-purge-type-level-pin-line-refs.mjs
+run node ./scripts/validate-capabilities-purge-type-level-pin-line-refs.mjs
+run node ./scripts/validate-capabilities-purge-older-than-ms-resolution-line-refs.mjs
+run node ./scripts/validate-peers-purge-type-level-pin-line-refs.mjs
+run node ./scripts/validate-peers-rotate-type-level-pin-line-refs.mjs
+run node ./scripts/validate-peer-revoke-type-level-pin-line-refs.mjs
+run node ./scripts/validate-audit-verify-type-level-pin-line-refs.mjs
+run node ./scripts/validate-chain-status-type-level-pin-line-refs.mjs
+run node ./scripts/validate-capability-revoke-type-level-pin-line-refs.mjs
+run node ./scripts/validate-verify-report-type-level-pin-line-refs.mjs
+run node ./scripts/validate-tool-list-type-level-pin-line-refs.mjs
+run node ./scripts/validate-receipt-batch-flushed-type-level-pin-line-refs.mjs
+run node ./scripts/validate-receipt-batch-list-type-level-pin-line-refs.mjs
+run node ./scripts/validate-bootstrap-result-type-level-pin-line-refs.mjs
+run node ./scripts/validate-memory-compaction-type-level-pin-line-refs.mjs
+run node ./scripts/validate-a2a-retry-type-level-pin-line-refs.mjs
+run node ./scripts/validate-a2a-compact-type-level-pin-line-refs.mjs
+run node ./scripts/validate-settlement-backfill-type-level-pin-line-refs.mjs
+run node ./scripts/validate-memory-backfill-type-level-pin-line-refs.mjs
+run node ./scripts/validate-memory-compaction-plan-type-level-pin-line-refs.mjs
+run node ./scripts/validate-memory-compaction-plan-outcome-type-level-pin-line-refs.mjs
+run node ./scripts/validate-ping-type-level-pin-line-refs.mjs
+run node ./scripts/validate-audit-verify-root-hash-hex-length-pin-line-refs.mjs
+run node ./scripts/validate-audit-verify-report-failures-empty-pin-line-refs.mjs
+run node ./scripts/validate-memory-compaction-plan-records-empty-renders-pin-line-refs.mjs
+run node ./scripts/validate-memory-compaction-outcome-deleted-empty-renders-pin-line-refs.mjs
+run node ./scripts/validate-memory-compaction-outcome-parents-detached-empty-renders-pin-line-refs.mjs
+run node ./scripts/validate-intents-resume-error-ok-false-pin-line-refs.mjs
+run node ./scripts/validate-bootstrap-result-granted-entries-object-pin-line-refs.mjs
+run node ./scripts/validate-bootstrap-result-already-granted-entries-string-pin-line-refs.mjs
+run node ./scripts/validate-bootstrap-result-empty-granted-no-new-grants-pin-line-refs.mjs
+run node ./scripts/validate-settlement-backfill-schema-value-pin-line-refs.mjs
+run node ./scripts/validate-memory-backfill-schema-value-pin-line-refs.mjs
+run node ./scripts/validate-memory-backfill-savepoint-name-non-empty-pin-line-refs.mjs
+run node ./scripts/validate-bootstrap-result-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-daemon-ping-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-peer-list-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-peer-revoke-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-intent-result-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-receipt-list-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-capability-list-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-capability-granted-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-capability-revoked-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-capabilities-purged-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-peers-purged-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-peer-token-rotated-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-audit-recent-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-audit-purged-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-audit-integrity-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-memory-purged-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-memory-read-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-memory-compacted-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-memory-compaction-plan-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-ignore-report-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-chain-status-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-verify-report-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-tool-list-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-tool-result-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-receipt-batch-flushed-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-receipt-batch-list-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-a2a-status-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-a2a-auto-retry-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-a2a-compacted-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-intents-resume-kind-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-intents-resume-ok-text-type-level-pin-line-refs.mjs
+run node ./scripts/validate-intents-resume-mode-type-level-pin-line-refs.mjs
+run node ./scripts/validate-intents-resume-status-type-level-pin-line-refs.mjs
+run node ./scripts/validate-intent-result-text-type-level-pin-line-refs.mjs
+run node ./scripts/validate-intent-result-status-type-level-pin-line-refs.mjs
+run node ./scripts/validate-a2a-status-tasks-type-level-pin-line-refs.mjs
+run node ./scripts/validate-peer-list-peers-type-level-pin-line-refs.mjs
+run node ./scripts/validate-verify-report-drift-type-level-pin-line-refs.mjs
+run node ./scripts/validate-tool-result-name-type-level-pin-line-refs.mjs
+run node ./scripts/validate-memory-read-mode-type-level-pin-line-refs.mjs
+run node ./scripts/validate-daemon-ping-status-literal-value-pin-line-refs.mjs
+run node ./scripts/validate-tool-list-no-tools-print-line-refs.mjs
+run node ./scripts/validate-capability-revoke-no-live-print-line-refs.mjs
+run node ./scripts/validate-a2a-status-queue-empty-print-line-refs.mjs
+run node ./scripts/validate-tool-list-tool-format-print-line-refs.mjs
+run node ./scripts/validate-capability-list-limit-default-line-refs.mjs
+run node ./scripts/validate-peer-list-limit-default-line-refs.mjs
+run node ./scripts/validate-a2a-status-limit-default-line-refs.mjs
+run node ./scripts/validate-capability-list-print-format-line-refs.mjs
+run node ./scripts/validate-intent-result-prefer-stream-line-refs.mjs
+run node ./scripts/validate-settlement-backfill-section-preamble-line-refs.mjs
+run node ./scripts/validate-ignore-report-exit-code-line-refs.mjs
+run node ./scripts/validate-ignore-report-matched-print-line-refs.mjs
+run node ./scripts/validate-ignore-report-unmatched-print-line-refs.mjs
+run node ./scripts/validate-ignore-report-cli-wiring-line-refs.mjs
+run node ./scripts/validate-intents-resume-success-return-line-refs.mjs
+run node ./scripts/validate-intents-resume-error-code-fn-range-line-refs.mjs
+run node ./scripts/validate-intents-resume-cli-wiring-line-refs.mjs
+run node ./scripts/validate-intents-resume-unexpected-response-slug-line-refs.mjs
+run node ./scripts/validate-intents-resume-daemon-error-slug-line-refs.mjs
+run node ./scripts/validate-intents-resume-mode-cli-derivation-line-refs.mjs
+run node ./scripts/validate-intents-resume-cli-sources-print-range-line-refs.mjs
+run node ./scripts/validate-intents-resume-exit-code-coupling-line-refs.mjs
+run node ./scripts/validate-peer-revoke-exit-code-classifier-line-refs.mjs
+run node ./scripts/validate-intents-resume-error-intent-id-inline-ranges-line-refs.mjs
+run node ./scripts/validate-settlement-backfill-cli-wiring-line-refs.mjs
+run node ./scripts/validate-memory-backfill-cli-wiring-line-refs.mjs
+run node ./scripts/validate-settlement-backfill-cli-print-range-line-refs.mjs
+run node ./scripts/validate-memory-backfill-cli-print-range-line-refs.mjs
+run node ./scripts/validate-settlement-backfill-response-variant-line-refs.mjs
+run node ./scripts/validate-memory-backfill-response-variant-line-refs.mjs
+run node ./scripts/validate-settlement-backfill-rollback-path-inline-line-refs.mjs
+run node ./scripts/validate-memory-backfill-savepoint-name-field-type-line-refs.mjs
+run node ./scripts/validate-settlement-backfill-scope-pubkey-forwarding-line-refs.mjs
+run node ./scripts/validate-memory-backfill-scope-pubkey-forwarding-line-refs.mjs
+run node ./scripts/validate-settlement-backfill-scope-pubkey-reservation-help-line-refs.mjs
+run node ./scripts/validate-memory-backfill-scope-pubkey-reservation-help-line-refs.mjs
+run node ./scripts/validate-memory-backfill-verb-asymmetry-match-arm-line-refs.mjs
+
+case "$mode" in
+  scripts)
+    ;;
+  quick)
+    run cargo check --workspace --exclude noren-settlement-program --exclude noren-stake-program --locked
+    run cargo test --workspace --exclude noren-settlement-program --exclude noren-stake-program --locked
+    # evm/ is a workspace-detached crate (own lockfile), so --workspace skips it.
+    run cargo test --manifest-path evm/Cargo.toml --locked
+    ;;
+  full)
+    run cargo build --workspace --exclude noren-settlement-program --exclude noren-stake-program --locked
+    run cargo clippy --workspace --all-targets --exclude noren-settlement-program --exclude noren-stake-program --locked -- -D warnings
+    run cargo test --workspace --exclude noren-settlement-program --exclude noren-stake-program --locked
+    run cargo test --manifest-path evm/Cargo.toml --locked
+    ;;
+  live)
+    run cargo test --workspace --exclude noren-settlement-program --exclude noren-stake-program --locked -- --ignored live_
+    ;;
+esac
