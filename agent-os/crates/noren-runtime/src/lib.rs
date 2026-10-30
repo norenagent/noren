@@ -1199,6 +1199,12 @@ impl DockerWorkspaceRun {
     }
 }
 
+impl Default for DockerWorkspaceRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DockerWorkspaceRunner {
     pub fn new() -> Self {
         Self::with_paths(

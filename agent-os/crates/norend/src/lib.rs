@@ -4000,7 +4000,7 @@ impl Server {
     }
 
     fn list_tools(&self) -> Response {
-        let mut tools = self.tools.list_specs();
+        let tools = self.tools.list_specs();
         Response::ToolList { tools }
     }
 
@@ -16611,25 +16611,6 @@ mod tests {
         let content = vec![noren_mcp::Content::text("no provenance here")];
         assert!(extract_acedata_provenance(&content).is_none());
     }
-
-    fn server_with_tool(tool: Arc<dyn noren_mcp::Tool>) -> Server {
-        Server::new(
-            Arc::new(Router::from_cards(vec![])),
-            Arc::new(MockRunner::new("")),
-            Arc::new(InMemoryStore::new()),
-            Arc::new(InMemorySettlement::new()),
-            Arc::new(noren_audit::InMemoryAuditLog::new()),
-            Arc::new(noren_permissions::InMemoryCapabilityStore::new()),
-            Arc::new(noren_llm::MockEmbedder::new(64)),
-            Arc::new(LocalIdentity::generate("user@local")),
-            Arc::new(IgnoreSet::default()),
-            Arc::new(ToolRegistry::from_tools(vec![tool])),
-            Arc::new(noren_a2a::InMemoryMailbox::new()),
-            Arc::new(noren_peer_auth::InMemoryPeerRegistry::new()),
-            Arc::new(noren_budget::InMemoryLedger::new()),
-        )
-    }
-
     fn stub_card(id: &str, capabilities: Vec<&str>) -> AgentCard {
         let toml = format!(
             r#"
@@ -17216,30 +17197,6 @@ required = {caps:?}
                 "HermesFileWritten trace must map to AuditKind::HermesFileWritten, got {other:?}",
             ),
         }
-    }
-
-    /// Success-path audit exposure of an IPC [`Request`]. This enum and the
-    /// exhaustive [`audit_exposure`] match are the single source of truth for
-    /// which privileged daemon actions land on the audit log; the operator
-    /// contract is documented in `docs/audit-integrity.md` (Privileged Action
-    /// Coverage).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum AuditExposure {
-        /// Read-only query/inspection — not a privileged action. A few are
-        /// capability-gated and emit a `CapabilityCheck` row, but that is
-        /// authorization logging, not an action record.
-        ReadQuery,
-        /// Privileged action that emits an action-specific audit row on its
-        /// success path (`IntentDispatched`, `CapabilityGranted`, `PeerRevoked`,
-        /// `MemoryCompactionApplied`, ...).
-        ActionAudited,
-        /// Privileged action whose success path is recorded only by the
-        /// `CapabilityCheck` authorization row (`passed = true`); there is no
-        /// action-specific row. The authorized attempt still lands on the chain.
-        AuthorizationAudited,
-        /// Privileged action that records nothing on its success path. A tracked
-        /// accountability gap — see the assertion below and the doc.
-        Unaudited,
     }
 
     #[tokio::test]
@@ -65277,7 +65234,6 @@ budget_credits_per_hour = {credits}
                 enabled: true,
                 signer_binary: std::path::PathBuf::from("/bin/true"),
                 signer_env: vec![],
-                ..Default::default()
             });
         let resp = s.op_respond(pay_x402_req()).await;
         match resp {
@@ -65858,7 +65814,6 @@ budget_credits_per_hour = {credits}
             enabled: true,
             signer_binary: std::path::PathBuf::from("/bin/true"),
             signer_env: vec![],
-            ..Default::default()
         });
         grant_scoped_action(
             &s,

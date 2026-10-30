@@ -66,7 +66,7 @@ use noren_types::{
     MemoryRepairCommand, MemoryRepairMode, MemoryRepairRequest, MemoryTier, ResourceKind,
     SettlementReceipt,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::net::UnixStream;
 
 fn noren_home() -> Result<PathBuf> {
@@ -6441,102 +6441,5 @@ mod tests {
             err.to_string().contains("mutually exclusive"),
             "error mentions mutual exclusion: {err}"
         );
-    }
-
-    mod keypair_loader {
-        use std::io::Write;
-        use std::path::PathBuf;
-        use tempfile::tempdir;
-
-        fn write_bytes(dir: &std::path::Path, name: &str, bytes: &[u8]) -> PathBuf {
-            let path = dir.join(name);
-            let mut f = std::fs::File::create(&path).expect("create fixture");
-            f.write_all(bytes).expect("write fixture");
-            path
-        }
-    }
-
-    mod anchor_discriminator {
-
-        // These three byte arrays are the canonical Anchor instruction
-        // discriminators the on-chain settlement program (declared in
-        // agent-os/programs/settlement/src/lib.rs) accepts for the three
-        // operator-signed verbs. Independently reproducible with:
-        //   python3 -c 'import hashlib;\
-        //     print(list(hashlib.sha256(b"global:register_agent").digest()[:8]))'
-        // A regression in compute_anchor_global_discriminator that drops
-        // the "global:" prefix, hashes the wrong slice of the digest, or
-        // accepts a non-snake-case method name would silently produce
-        // bytes the dispatcher routes to InstructionFallbackNotFound; the
-        // tests below pin the byte stream so that regression is loud.
-    }
-
-    mod build_register_agent_instruction {}
-
-    mod build_stake_instruction {}
-
-    mod build_buy_credits_instruction {}
-
-    mod register_agent_args {
-        use borsh::BorshDeserialize;
-    }
-
-    mod cluster_rpc_url {}
-
-    mod settlement_pda {}
-
-    mod stake_args {
-        use borsh::BorshDeserialize;
-    }
-
-    mod buy_credits_args {
-        use borsh::BorshDeserialize;
-    }
-
-    mod keypair_mode {
-        use std::io::Write;
-        use tempfile::tempdir;
-
-        #[cfg(unix)]
-        fn set_mode(path: &std::path::Path, mode: u32) {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-                .expect("set mode");
-        }
-    }
-
-    mod register_agent_arg_parsing {
-
-        fn hex_32(b: u8) -> String {
-            (0..32).map(|_| format!("{b:02x}")).collect::<String>()
-        }
-    }
-
-    mod register_agent_tx_shape {}
-
-    mod register_agent_json_envelopes {}
-
-    mod stake_arg_parsing {}
-
-    mod stake_tx_shape {}
-
-    mod stake_json_envelopes {}
-
-    mod buy_credits_arg_parsing {}
-
-    mod buy_credits_tx_shape {}
-
-    mod buy_credits_json_envelopes {}
-
-    fn signer_requirements() -> noren_x402::PaymentRequirements {
-        noren_x402::PaymentRequirements {
-            network: "eip155:4663".into(),
-            asset: "usdg".into(),
-            amount: "80000".into(),
-            amount_usdc: 0.08,
-            pay_to: "9VaDVp1Wb78G4Wm6VuTiMrpESjrUymXefQTHcJGRSTEA".into(),
-            scheme: "exact".into(),
-            extra: None,
-        }
     }
 }
