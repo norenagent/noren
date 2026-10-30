@@ -168,7 +168,7 @@
     },
     {
       "canonical_json": "{\"id\":\"00000000-0000-0000-0000-000000000022\",\"timestamp_ms\":1700000000034,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"external_payment_settled\",\"provider\":\"xona\",\"endpoint\":\"https://api.example.com/x402\",\"network\":\"eip155:4663\",\"asset\":\"USDC\",\"amount\":\"1000000\",\"receipt_id\":\"00000000-0000-0000-0000-0000000000e1\"}}",
-      "event_hash_hex": "dac050e548baea765e6b70222329f66e15b95c64a23af7975950f124f049aa5d",
+      "event_hash_hex": "ece71e3319a302a5923290c015c0d591b932b76c8bbe2d00e57a53666be63e77",
       "name": "external_payment_settled"
     },
     {
@@ -223,22 +223,22 @@
     },
     {
       "canonical_json": "{\"id\":\"00000000-0000-0000-0000-00000000002d\",\"timestamp_ms\":1700000000045,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"spend_authorization_decided\",\"provider\":\"xona\",\"network\":\"eip155:4663\",\"asset\":\"USDC\",\"amount\":\"0.25\",\"credits\":250,\"destination\":\"So11111111111111111111111111111111111111112\",\"approved\":true,\"reason\":\"within per-call cap\",\"decision_id\":\"5e111ed0-0000-0000-0000-000000000001\"}}",
-      "event_hash_hex": "c781ebd38df85abfbd00c1d2c098ac4db5c57ae96ce1b0cc4914ab7f7c614f36",
+      "event_hash_hex": "fc8569e4b2b6802ca38c91e49dd1f446c7345e93ffc2452172f6ec6afedbad7e",
       "name": "spend_authorization_decided"
     },
     {
       "canonical_json": "{\"id\":\"00000000-0000-0000-0000-00000000002e\",\"timestamp_ms\":1700000000046,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"spend_settled\",\"decision_id\":\"5e111ed0-0000-0000-0000-000000000001\",\"receipt_id\":\"5e111ed0-0000-0000-0000-000000000004\",\"provider\":\"xona\",\"network\":\"eip155:4663\",\"asset\":\"USDC\",\"amount\":\"0.25\",\"credits\":250,\"tx_sig\":\"2Zq7Xs9wV3kLp8mNc1bR4tYd6uHf\"}}",
-      "event_hash_hex": "e5d3f93570b50f81ae3ea567d6ad6ebeeada8d589d8e82929670c79ea6a4d524",
+      "event_hash_hex": "fd027a1623a4911f856e02071a665a8e4522773e189301a8c23ae5569e87bde4",
       "name": "spend_settled"
     },
     {
       "canonical_json": "{\"id\":\"00000000-0000-0000-0000-00000000002f\",\"timestamp_ms\":1700000000047,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"escrow_completion_proven\",\"proof_id\":\"5e111ed0-0000-0000-0000-000000000005\",\"escrow_id\":\"escrow-001\",\"job_id\":\"5e111ed0-0000-0000-0000-000000000006\",\"hirer_address\":\"Hirer111111111111111111111111111111111111\",\"worker_address\":\"Worker11111111111111111111111111111111111\",\"amount\":\"10.00\",\"asset\":\"USDC\",\"network\":\"eip155:4663\",\"provider\":\"orbserv\",\"result_hash_hex\":\"67a49d096d79346e7ccaa075b54fc8b9db37a9da34430ac07b47601cf935d4f9\",\"validation_passed\":true,\"audit_root_hex\":\"b474ea02bc00b3ae7449e33c6c993b3472fe6f0d56d72d1703c8e5229e4912d3\",\"signature_b58\":\"2Zq7Xs9wV3kLp8mNc1bR4tYd6uHf\"}}",
-      "event_hash_hex": "893691ec7092c4a699a1ee79c8df9632d001501a5903097363ac54630826b2ab",
+      "event_hash_hex": "8cd5d433919a45f43031e531ce1c48e6a316fde695eeebb7763e7ca1fb0c31ba",
       "name": "escrow_completion_proven"
     },
     {
       "canonical_json": "{\"id\":\"00000000-0000-0000-0000-000000000030\",\"timestamp_ms\":1700000000048,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"escrow_released\",\"decision_id\":\"5e111ed0-0000-0000-0000-000000000002\",\"receipt_id\":\"5e111ed0-0000-0000-0000-000000000007\",\"escrow_id\":\"escrow-001\",\"hirer_address\":\"Hirer111111111111111111111111111111111111\",\"worker_address\":\"Worker11111111111111111111111111111111111\",\"amount\":\"10.00\",\"asset\":\"USDC\",\"network\":\"eip155:4663\",\"provider\":\"orbserv\",\"tx_sig\":\"2Zq7Xs9wV3kLp8mNc1bR4tYd6uHf\"}}",
-      "event_hash_hex": "f391478e7b762c1bcf6c9b9bb58276aebece0b324759e67e15fdd48677cf8ccf",
+      "event_hash_hex": "fa27ca54107bbe74827fbc70c423072524fc15b6e0abbfba52f1b5d689766f72",
       "name": "escrow_released"
     },
     {

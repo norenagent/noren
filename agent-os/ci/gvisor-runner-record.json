@@ -4,9 +4,9 @@
   "approved_by": "norenagent-release-operator",
   "approved_at": "2026-05-10",
   "runsc": {
-    "release_id": "20240701.0",
-    "release_url": "https://storage.googleapis.com/gvisor/releases/release/20240701.0/x86_64/runsc",
-    "checksum_url": "https://storage.googleapis.com/gvisor/releases/release/20240701.0/x86_64/runsc.sha512",
+    "release_id": "20260105.0",
+    "release_url": "https://storage.googleapis.com/gvisor/releases/release/20260105.0/x86_64/runsc",
+    "checksum_url": "https://storage.googleapis.com/gvisor/releases/release/20260105.0/x86_64/runsc.sha512",
     "platform": "ptrace"
   },
   "rootfs": {

@@ -59,7 +59,7 @@
           "maximum": 1779957192000
         },
         "evidenceRefs": [
-          "sha256:496bd6b7c248a87198d380484ee45c23a435b2cc87dd34b97b98457e9605d815"
+          "sha256:1cdde616e04c843b9dd521356f44e923704382f91ccc2d24f7c8d186fe274248"
         ]
       }
     },
@@ -77,7 +77,7 @@
           "maximum": 1779957705698
         },
         "evidenceRefs": [
-          "sha256:f9ecfc04d23045ffdfc16f09e6c4a8114b29911f4be4c94c4696b7769810e30a"
+          "sha256:7cb78469f64d2dc414b6ee684c6ba109f759e877e7d2ec2288a5ea6101b0072c"
         ]
       }
     },
@@ -95,7 +95,7 @@
           "maximum": 1779957345000
         },
         "evidenceRefs": [
-          "sha256:e56a615638a030c2506949f77eca1af9f0a4b356dc7d2e42cbe4ea413b97e8f4"
+          "sha256:3acee9a24411590689ba843440182349ca38126efb48cc248a0fea2242d115cb"
         ]
       }
     },
@@ -106,7 +106,7 @@
       "sequence": 5,
       "assertionId": "release.publication.provisional.v1",
       "evidenceRefs": [
-        "sha256:e56a615638a030c2506949f77eca1af9f0a4b356dc7d2e42cbe4ea413b97e8f4"
+        "sha256:3acee9a24411590689ba843440182349ca38126efb48cc248a0fea2242d115cb"
       ]
     }
   ]
