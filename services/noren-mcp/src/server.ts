@@ -1,8 +1,11 @@
+#!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { Wallet, JsonRpcProvider, Contract } from 'ethers';
 
 type TextContent = { type: 'text'; text: string };
@@ -336,15 +339,21 @@ export async function realPay(args: Parameters<PayFn>[0]): Promise<Awaited<Retur
 }
 
 // ---- server ----------------------------------------------------------------
-export function buildServer(deps: { env?: NodeJS.ProcessEnv; fetchImpl?: Fetch; pay?: PayFn } = {}) {
+export function buildServer(deps: { env?: NodeJS.ProcessEnv; fetchImpl?: Fetch; pay?: PayFn; exposePay?: boolean } = {}) {
   const env = deps.env ?? process.env;
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const exposePay = deps.exposePay ?? true;
   const ledger: Ledger = { day: today(), spent: 0 };
-  const server = new Server({ name: 'noren', version: '0.1.0' }, { capabilities: { tools: {} } });
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-  server.setRequestHandler(CallToolRequestSchema, async (request) =>
-    callTool(request.params.name, request.params.arguments ?? {}, { env, fetchImpl, ledger, pay: deps.pay ?? realPay }),
-  );
+  const server = new Server({ name: 'noren', version: '0.1.2' }, { capabilities: { tools: {} } });
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: exposePay ? TOOLS : TOOLS.filter((t) => t.name !== 'noren_pay_call'),
+  }));
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    if (!exposePay && request.params.name === 'noren_pay_call') {
+      return asError('noren_pay_call is not available on the hosted endpoint. Run noren-mcp locally over stdio with your own NOREN_PAYER_KEY.');
+    }
+    return callTool(request.params.name, request.params.arguments ?? {}, { env, fetchImpl, ledger, pay: exposePay ? (deps.pay ?? realPay) : undefined });
+  });
   return server;
 }
 
@@ -353,7 +362,16 @@ async function main() {
   await server.connect(new StdioServerTransport());
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+function isEntrypoint(): boolean {
+  // npm runs bins through a symlink in node_modules/.bin, so compare real paths.
+  try {
+    return !!process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+if (isEntrypoint()) {
   main().catch((error) => {
     console.error(redact(String(error?.message ?? error), process.env));
     process.exit(1);

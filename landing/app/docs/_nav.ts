@@ -37,6 +37,7 @@ export const DOCS_NAV: DocsSection[] = [
     items: [
       { href: "/capabilities", label: "Capability tokens" },
       { href: "/mcp", label: "MCP integration" },
+      { href: "/mcp-server", label: "Noren MCP server" },
       { href: "/a2a", label: "Agent-to-agent" },
       { href: "/a2a-idempotency", label: "A2A idempotency policy" },
       { href: "/audit", label: "Audit log" },

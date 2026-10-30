@@ -1,4 +1,4 @@
-# @noren/mcp
+# noren-mcp
 
 MCP server for [Noren](https://usenoren.xyz): read the x402 gateway, check a wallet's reputation, verify a payment straight from the chain, and pay for a gateway API in USDG on Robinhood Chain.
 
@@ -18,13 +18,13 @@ Every tool wraps something that is live today. There is no GPU, staking or escro
 ## Add it to a client
 
 ```bash
-claude mcp add noren --transport stdio -- npx -y @noren/mcp
+claude mcp add noren --transport stdio -- npx -y noren-mcp
 ```
 
 or in any MCP client config:
 
 ```json
-{ "mcpServers": { "noren": { "command": "npx", "args": ["-y", "@noren/mcp"] } } }
+{ "mcpServers": { "noren": { "command": "npx", "args": ["-y", "noren-mcp"] } } }
 ```
 
 The five read tools need no configuration.
