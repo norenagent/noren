@@ -1,0 +1,136 @@
+{
+  "schema": "noren.timeline.run.v0alpha1",
+  "runId": "noren.timeline.m3",
+  "contract": {
+    "checkpoints": [
+      {
+        "id": "pause-recorded",
+        "requirements": ["engineering.pause.recorded"]
+      },
+      {
+        "id": "resume-recorded",
+        "requirements": ["engineering.resume.recorded"]
+      },
+      {
+        "id": "review-complete",
+        "requirements": ["engineering.review.passed"]
+      },
+      {
+        "id": "release-ready",
+        "onAccept": {
+          "kind": "noren.capability.request",
+          "payloadRef": "release.publish"
+        },
+        "requirements": ["engineering.release.artifact-ready"]
+      }
+    ],
+    "id": "noren.engineering.v0",
+    "schema": "noren.timeline.contract.v0alpha1",
+    "subject": {
+      "id": "norenagent/noren",
+      "kind": "repository"
+    }
+  },
+  "events": [
+    {
+      "schema": "noren.timeline.event.v0alpha1",
+      "id": "event-0",
+      "sequence": 0,
+      "type": "evidence.recorded",
+      "evidence": {
+        "id": "m0-pause",
+        "kind": "noren.provenance",
+        "claims": ["engineering.pause.recorded"],
+        "payloadDigest": "sha256:6ef9fa48782e16a57b36bc17cc356a0d2742c9e8345b5a8bca953b81a2bb7c8a",
+        "producer": "noren.git"
+      }
+    },
+    {
+      "schema": "noren.timeline.event.v0alpha1",
+      "id": "event-1",
+      "sequence": 1,
+      "type": "checkpoint.evaluated",
+      "checkpointId": "pause-recorded",
+      "evidenceRefs": ["m0-pause"],
+      "policyRef": "noren.engineering.v0"
+    },
+    {
+      "schema": "noren.timeline.event.v0alpha1",
+      "id": "event-2",
+      "sequence": 2,
+      "type": "evidence.recorded",
+      "evidence": {
+        "id": "m3-resume",
+        "kind": "noren.audit-event",
+        "claims": ["engineering.resume.recorded"],
+        "payloadDigest": "sha256:e374d29d5eb27ba960375305b616f6387c9924d00f165ad1508027411d024df9",
+        "producer": "noren.audit"
+      }
+    },
+    {
+      "schema": "noren.timeline.event.v0alpha1",
+      "id": "event-3",
+      "sequence": 3,
+      "type": "checkpoint.evaluated",
+      "checkpointId": "resume-recorded",
+      "evidenceRefs": ["m3-resume"],
+      "policyRef": "noren.engineering.v0"
+    },
+    {
+      "schema": "noren.timeline.event.v0alpha1",
+      "id": "event-4",
+      "sequence": 4,
+      "type": "evidence.recorded",
+      "evidence": {
+        "id": "m3-review",
+        "kind": "validation",
+        "claims": ["engineering.review.passed"],
+        "payloadDigest": "sha256:1d98d597714f6a796f0f1c1b7f2381e90bb3549f4f26551e756cf55c34c5ec87",
+        "producer": "noren.local"
+      }
+    },
+    {
+      "schema": "noren.timeline.event.v0alpha1",
+      "id": "event-5",
+      "sequence": 5,
+      "type": "checkpoint.evaluated",
+      "checkpointId": "review-complete",
+      "evidenceRefs": ["m3-review"],
+      "policyRef": "noren.engineering.v0"
+    },
+    {
+      "schema": "noren.timeline.event.v0alpha1",
+      "id": "event-6",
+      "sequence": 6,
+      "type": "evidence.recorded",
+      "evidence": {
+        "id": "m3-release",
+        "kind": "package",
+        "claims": ["engineering.release.artifact-ready"],
+        "payloadDigest": "sha256:7bea63d6600544aa5ba749321c7037a439125bb33cab5538a7ded76199004c3a",
+        "producer": "noren.local"
+      }
+    },
+    {
+      "schema": "noren.timeline.event.v0alpha1",
+      "id": "event-7",
+      "sequence": 7,
+      "type": "checkpoint.evaluated",
+      "checkpointId": "release-ready",
+      "evidenceRefs": ["m3-release"],
+      "policyRef": "noren.engineering.v0"
+    },
+    {
+      "schema": "noren.timeline.event.v0alpha1",
+      "id": "event-8",
+      "sequence": 8,
+      "type": "receipt.recorded",
+      "receipt": {
+        "id": "receipt/noren.timeline.m3:release-ready:7",
+        "commandId": "noren.timeline.m3:release-ready:7",
+        "status": "succeeded",
+        "effectDigest": "sha256:03183d65d0a01e6e9b8855e912875c5a3257957ae5760b7bccf75b360344a837"
+      }
+    }
+  ]
+}

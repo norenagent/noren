@@ -1,0 +1,36 @@
+{
+  "description": "Frozen golden vectors for the provenance/audit record schema (noren-audit AuditEvent + the capability family of AuditKind). canonical_json is the exact serde_json wire form of each AuditEvent — the bytes hashed into the tamper-evident chain; event_hash_hex is sha256(canonical_json); chain_root_hash_hex is the genesis-seeded chain fold over all records in order, as computed by AuditLog::verify_integrity. This is an external conformance contract other implementations verify against. A change here breaks every downstream verifier: update only as a deliberate, reviewed schema change (and bump the .v<n> suffix for an incompatible shape) — never blindly regenerate to make a failing test pass.",
+  "records": [
+    {
+      "name": "capability_check_partial_grant",
+      "canonical_json": "{\"id\":\"00000000-0000-0000-0000-000000000001\",\"timestamp_ms\":1700000000000,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"capability_check\",\"agent_id\":\"research@agent\",\"required_actions\":[\"memory.write\",\"a2a.send\"],\"missing_actions\":[\"a2a.send\"],\"passed\":false,\"authorized_by\":[{\"action\":\"memory.write\",\"granted_by_display\":\"operator@noren\",\"signature_b58\":\"GrantSigWrite\"}]}}",
+      "event_hash_hex": "d713b0d57cc19e857ed5fa522feae1121c362c116e98067e835fb0150934081f"
+    },
+    {
+      "name": "capability_granted",
+      "canonical_json": "{\"id\":\"00000000-0000-0000-0000-000000000002\",\"timestamp_ms\":1700000000001,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"capability_granted\",\"subject_display\":\"research@agent\",\"action\":\"memory.write\",\"granted_by_display\":\"operator@noren\",\"signature_b58\":\"GrantSigWrite\"}}",
+      "event_hash_hex": "5c1af26ed617f97f10dc214e92b14839232a0de93d4cbdecb1f59ab338d2bf5d"
+    },
+    {
+      "name": "capability_grant_rejected",
+      "canonical_json": "{\"id\":\"00000000-0000-0000-0000-000000000003\",\"timestamp_ms\":1700000000002,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"capability_grant_rejected\",\"subject_display\":\"research@agent\",\"action\":\"memory.write\",\"reason\":\"capability expired\"}}",
+      "event_hash_hex": "8bbb9cfd1fe2fd9bc46fce87ddfcbccad4d6ceb36c8c1a9a8ff41a6fdfcdc1d9"
+    },
+    {
+      "name": "capability_scope_rejected",
+      "canonical_json": "{\"id\":\"00000000-0000-0000-0000-000000000004\",\"timestamp_ms\":1700000000003,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"capability_scope_rejected\",\"agent_id\":\"research@agent\",\"action\":\"audit.purge\",\"reason\":\"before_ms exceeds granted scope\"}}",
+      "event_hash_hex": "44d731459560b3a0b91438e4514b30d3dd3dc0e7d6e96d0b9744554c8f08e01e"
+    },
+    {
+      "name": "capability_revoked",
+      "canonical_json": "{\"id\":\"00000000-0000-0000-0000-000000000005\",\"timestamp_ms\":1700000000004,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"capability_revoked\",\"subject_display\":\"research@agent\",\"action\":\"memory.write\",\"signature_b58\":\"GrantSigWrite\",\"removed\":true}}",
+      "event_hash_hex": "d169fae91fe4190c339a07f241f2712fcf0d320c7bb1f29b6c4ad946dd4867d8"
+    },
+    {
+      "name": "capability_revoke_rejected",
+      "canonical_json": "{\"id\":\"00000000-0000-0000-0000-000000000006\",\"timestamp_ms\":1700000000005,\"issuer\":{\"display\":\"operator@noren\",\"pubkey\":\"US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx\"},\"kind\":{\"type\":\"capability_revoke_rejected\",\"signature_b58\":\"OtherSig\",\"reason\":\"not the capability subject\"}}",
+      "event_hash_hex": "0b1d62aba0954810e229e4608f987414d7db948647184f888ee59320f96fdba1"
+    }
+  ],
+  "chain_root_hash_hex": "0b2ab34a76f0a36da68688f9008bfcdcc3d7e52c7895723c462a39bc37065f83"
+}

@@ -1,0 +1,104 @@
+import Link from "next/link";
+import { buildDocsMetadata, buildDocsJsonLd } from "../_meta";
+
+const META_ARGS = ["live-coverage", "Live coverage", 'Opt-in live test coverage across daemon, CLI, A2A, MCP, runtime, and model boundaries.'] as const;
+export const metadata = buildDocsMetadata(...META_ARGS);
+
+const SURFACES = [
+  ["Daemon IPC core", "covered", "daemon IPC plus CLI intent/resume/version"],
+  ["State verifier", "covered", "typed repair hints"],
+  ["Memory retention", "covered", "record-to-receipt correlation"],
+  ["HTTP gateway", "covered", "audit and capabilities purge mutations"],
+  ["CLI capability lifecycle", "covered", "capability purge after retention defaults"],
+  ["CLI audit feed", "covered", "audit query filters after predicate support"],
+  ["Ignore policy gate", "covered", "scoped ignore override policy"],
+  ["Peer authentication", "covered", "forced self-revoke recovery fixture"],
+  ["Peer listing", "covered", "ambiguous-prefix listing"],
+  ["A2A mailbox", "covered", "per-peer repair visibility"],
+  ["MCP subprocess", "covered", "third-party fixture"],
+  ["Runtime subprocess", "covered", "daemon dispatch failure receipts"],
+  ["Linux gVisor runtime", "external service", "documented Linux runsc runner"],
+  ["Budget enforcement", "covered", "resume success after pause/resume policy"],
+  ["Settlement receipts", "covered", "scoped receipt filters"],
+  ["Local model", "external service", "pin model set before more coverage"],
+];
+
+export default function LiveCoveragePage() {
+  return (
+    <>
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(buildDocsJsonLd(...META_ARGS)) }}
+      />
+      <h1>Live coverage</h1>
+      <p>
+        Noren keeps default CI deterministic while tracking which surfaces
+        have opt-in live coverage. Live tests are Rust tests named{" "}
+        <code>live_*</code> and marked with <code>#[ignore]</code>.
+        Public checkouts derive the inventory from source; private workflow
+        checkouts may run an additional matrix validator when its local script
+        is present.
+      </p>
+
+      <h2>Commands</h2>
+      <code>{`node agent-os/scripts/model-availability.mjs
+bash agent-os/scripts/test-stats.sh
+cd agent-os
+cargo test --workspace --exclude noren-settlement-program -- --ignored live_
+
+# Before targeted live CLI tests:
+cargo build -p noren --locked
+cargo test -p norend --test live_cli_version -- --ignored live_cli_version_reads_protocol_info_without_token
+
+# Linux gVisor runtime validation:
+NOREN_LIVE_GVISOR_ROOTFS=/path/to/rootfs \\
+  cargo test -p noren-runtime --test live_gvisor -- --ignored live_gvisor_runner_dispatches_with_runsc`}</code>
+
+      <p>
+        Linux gVisor coverage requires a Linux host with <code>runsc</code> and
+        a rootfs containing <code>/bin/sh</code>. The repeatable setup lives in{" "}
+        <Link href="/gvisor-live-runner">Linux gVisor runner</Link>.
+      </p>
+
+      <h2>Matrix</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Surface</th>
+            <th>Status</th>
+            <th>Next gap</th>
+          </tr>
+        </thead>
+        <tbody>
+          {SURFACES.map(([surface, status, gap]) => (
+            <tr key={surface}>
+              <td>{surface}</td>
+              <td>{status}</td>
+              <td>{gap}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <h2>Related</h2>
+      <ul>
+        <li>
+          <Link href="/architecture">System architecture</Link>: the
+          surfaces under test.
+        </li>
+        <li>
+          <Link href="/security">Security model</Link>: why real boundary
+          tests matter.
+        </li>
+        <li>
+          <Link href="/gvisor-live-runner">Linux gVisor runner</Link>: host
+          setup for the sandbox live path.
+        </li>
+        <li>
+          <Link href="/provenance">Provenance</Link>: evidence attached to
+          committed autonomous work.
+        </li>
+      </ul>
+    </>
+  );
+}

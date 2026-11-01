@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "paths": {
+      "@noren/ui": ["packages/ui/src/index.ts"],
+      "@noren/ui/*": ["packages/ui/src/*"],
+
+      "@noren/config/brand": ["packages/config/brand.mjs"],
+      "@noren/config/networks": ["packages/config/networks.mjs"]
+    }
+  }
+}

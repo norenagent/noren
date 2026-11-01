@@ -1,0 +1,30 @@
+{
+  "name": "noren-guard",
+  "version": "0.1.0",
+  "description": "Run Claude Code unattended: cap the spend, sandbox execution, and get a signed receipt, enforced from outside the agent's own process by the covguard binary.",
+  "author": {
+    "name": "Noren",
+    "url": "https://usenoren.xyz"
+  },
+  "homepage": "https://usenoren.xyz/guard",
+  "repository": "https://github.com/norenagent/noren",
+  "license": "Apache-2.0",
+  "keywords": [
+    "unattended",
+    "spend-cap",
+    "budget",
+    "sandbox",
+    "receipt",
+    "safety",
+    "overnight"
+  ],
+  "mcpServers": {
+    "noren-guard": {
+      "command": "covguard",
+      "args": [
+        "mcp"
+      ]
+    }
+  },
+  "privacyPolicyUrl": "https://usenoren.xyz/privacy"
+}

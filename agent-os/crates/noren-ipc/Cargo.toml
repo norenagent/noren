@@ -1,0 +1,22 @@
+[package]
+name = "noren-ipc"
+version = "0.1.0"
+description = "Length-prefixed JSON IPC shared by norend and the noren CLI. 4-byte big-endian length prefix, frames bounded at 8 MB via MAX_FRAME, and a versioned protocol shape (PROTOCOL_VERSION 1 baseline, MAX_PROTOCOL_VERSION 2 reserved for streaming responses)."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+noren-types = { path = "../noren-types" }
+noren-permissions = { path = "../noren-permissions" }
+noren-mcp = { path = "../noren-mcp" }
+noren-a2a = { path = "../noren-a2a" }
+noren-audit = { path = "../noren-audit" }
+noren-budget = { path = "../noren-budget" }
+noren-peer-auth = { path = "../noren-peer-auth" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }

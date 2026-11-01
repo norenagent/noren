@@ -1,0 +1,97 @@
+import type { Metadata } from "next";
+import { pageMetadata } from "@/app/_metadata";
+import { SiteFooter } from "../SiteFooter";
+import { SiteHeader } from "../SiteHeader";
+
+const TITLE = "Security";
+const DESCRIPTION =
+  "How to report a vulnerability in Noren, what's in scope, and the security posture: Apache-2.0 source, hash-chained audit, and on-chain attestation anyone can verify.";
+
+export const metadata: Metadata = pageMetadata("/security", { title: "Security" }, {
+  title: TITLE,
+  description: DESCRIPTION,
+  alternates: { canonical: "/security" },
+  openGraph: { type: "website", url: "https://usenoren.xyz/security", title: TITLE, description: DESCRIPTION },
+  twitter: { card: "summary_large_image", title: TITLE, description: DESCRIPTION },
+});
+
+const eyebrow = "font-mono text-[11px] uppercase tracking-[0.3em] text-muted";
+const paragraph = "text-[13px] leading-relaxed text-fg-soft sm:text-[14px]";
+const link =
+  "underline decoration-line-strong underline-offset-4 transition-colors hover:text-fg hover:decoration-fg-soft";
+
+export default function SecurityPage() {
+  return (
+    <>
+      <SiteHeader />
+      <main className="mx-auto w-full max-w-7xl px-5 pb-24 pt-[88px] sm:px-8 sm:pt-[120px]">
+        <p className={eyebrow}>disclosure &middot; scope &middot; posture</p>
+        <h1 className="page-title mt-4 text-fg">Security</h1>
+        <p className={`${paragraph} mt-5 max-w-2xl`}>
+          Noren governs agents that hold keys and move value, so its security model is the product, not
+          a footnote. The source is Apache-2.0 and public, every privileged action is hash-chained into a
+          signed audit, and audit roots are anchored on-chain where anyone can verify them. The point is
+          that you never have to take our word for it.
+        </p>
+
+        <section className="mt-12">
+          <p className={eyebrow}>report a vulnerability</p>
+          <p className={`${paragraph} mt-3 max-w-2xl`}>
+            Use{" "}
+            <a className={link} href="/contact">
+              the contact form
+            </a>{" "}
+            with a description and reproduction steps. A PGP key for sensitive reports: coming soon. Please give us a reasonable window to ship a fix before public disclosure. We do not pursue
+            researchers acting in good faith.
+          </p>
+        </section>
+
+        <section className="mt-12">
+          <p className={eyebrow}>in scope</p>
+          <ul className={`${paragraph} mt-3 max-w-2xl list-disc space-y-1.5 pl-5 text-muted`}>
+            <li>The Noren daemon (norend): intent dispatch, the permissions and capability engine, memory, and the IPC and HTTP gateways.</li>
+            <li>The Robinhood Chain programs: settlement and staking, and the on-chain attestation and identity records.</li>
+            <li>The sandbox at sandbox.usenoren.xyz.</li>
+            <li>Signature verification, canonicalization, and anything that could forge or replay a receipt.</li>
+          </ul>
+          <p className={`${paragraph} mt-3 max-w-2xl text-muted-2`}>
+            Out of scope: findings that require a compromised host or a leaked operator key, volumetric
+            denial of service, and issues in third-party services Noren integrates with rather than
+            operates.
+          </p>
+        </section>
+
+        <section className="mt-12">
+          <p className={eyebrow}>posture &middot; verify it as a property</p>
+          <p className={`${paragraph} mt-3 max-w-2xl`}>
+            A reckless action is refused before it reaches a wallet, a malicious signature is rejected
+            before it is signed, and every permitted action settles with a receipt anyone can check. The
+            mechanics are documented:{" "}
+            <a className={link} href="https://docs.usenoren.xyz/security">
+              runtime sandbox and gateway
+            </a>
+            ,{" "}
+            <a className={link} href="https://docs.usenoren.xyz/audit">
+              the hash-chained audit
+            </a>
+            ,{" "}
+            <a className={link} href="https://docs.usenoren.xyz/audit-integrity">
+              audit integrity
+            </a>
+            , and{" "}
+            <a className={link} href="https://docs.usenoren.xyz/capabilities">
+              the capability model
+            </a>
+            .
+          </p>
+        </section>
+
+        <p className={`${paragraph} mt-14 text-[11.5px] text-faint`}>
+          Noren is open source under Apache-2.0. There is no formal bug-bounty program at this time;
+          we acknowledge reporters who ask to be credited.
+        </p>
+      </main>
+      <SiteFooter className="pb-8" />
+    </>
+  );
+}

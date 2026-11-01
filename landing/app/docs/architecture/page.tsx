@@ -1,0 +1,600 @@
+import Link from "next/link";
+import { buildDocsMetadata, buildDocsJsonLd } from "../_meta";
+
+const META_ARGS = ["architecture", "System architecture", 'How the daemon, runtime, storage primitives, adapters, and the planned settlement contracts fit together.'] as const;
+export const metadata = buildDocsMetadata(...META_ARGS);
+
+export default function ArchitecturePage() {
+  return (
+    <>
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(buildDocsJsonLd(...META_ARGS)) }}
+      />
+      <h1>System architecture</h1>
+      <p>
+        Noren is a single long-running daemon (<code>norend</code>)
+        plus a thin set of clients (the CLI, the TUI, the web UI, third-party
+        tooling over HTTP) and a number of agent processes. The daemon is the only
+        component that holds state; everything else is replaceable.
+      </p>
+
+      <h2>Component map</h2>
+
+      <pre>
+        <code>{`┌──────────────────────────────────────────────────────────────┐
+│                          norend                           │
+│ ┌──────────┐  ┌──────────┐  ┌────────────┐  ┌────────────┐  │
+│ │  IPC     │  │   HTTP   │  │   MCP      │  │   A2A      │  │
+│ │  socket  │  │  gateway │  │ adapter    │  │ adapter    │  │
+│ └────┬─────┘  └────┬─────┘  └─────┬──────┘  └─────┬──────┘  │
+│      │             │              │               │          │
+│      ▼             ▼              ▼               ▼          │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │                    Server::respond                       │ │
+│ │ (intent dispatch, capability checks, audit, ignore set)  │ │
+│ └────────┬─────────┬─────────┬─────────┬─────────┬─────────┘ │
+│          │         │         │         │         │            │
+│          ▼         ▼         ▼         ▼         ▼            │
+│      ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────┐        │
+│      │Router│ │Runtime│ │Memory│ │ Audit│ │Settlement│        │
+│      └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───────┘        │
+│         │        │        │        │        │                │
+└─────────┼────────┼────────┼────────┼────────┼────────────────┘
+          │        │        │        │        │
+          ▼        ▼        ▼        ▼        ▼
+       cards    spawned  SQLite  JSONL    JSONL     local
+       on disk  processes  +    audit/   receipts  settlement
+                          embeds events           scaffold`}</code>
+      </pre>
+
+      <h2>Process model</h2>
+      <p>
+        <code>norend</code> runs as a single process per machine,
+        owned by the operator&apos;s user account. It owns:
+      </p>
+
+      <ul>
+        <li>
+          a Unix socket at <code>$NOREN_HOME/sock</code> for local
+          clients,
+        </li>
+        <li>
+          an HTTP listener on <code>127.0.0.1:8421</code> for browser-
+          facing UIs and third-party tooling (loopback only),
+        </li>
+        <li>
+          the SQLite memory database at{" "}
+          <code>$NOREN_HOME/memory.db</code>,
+        </li>
+        <li>
+          append-only JSONL stores under <code>$NOREN_HOME</code> for
+          audit, capabilities, peers, receipts, budget, and a2a,
+        </li>
+        <li>
+          the local ed25519 identity key.
+        </li>
+      </ul>
+
+      <p>
+        Subprocess-style agents (<code>rust-bin</code>,{" "}
+        <code>python3</code>, <code>node</code>) run as child processes
+        spawned on demand when an intent is dispatched. The runtime
+        registers each subprocess in an in-memory tracker, walks the
+        tracker on a periodic projection tick, and preempts via{" "}
+        <code>SIGTERM</code> with a grace window before{" "}
+        <code>SIGKILL</code> whenever <code>project_overshoot</code>{" "}
+        flags an in-flight process as on track to exceed its remaining
+        credit budget. The wall-clock kill at the agent-declared{" "}
+        <code>cpu_ms_per_task</code> remains as the final backstop.{" "}
+        <code>hermes</code>-runtime agents are not subprocesses; the
+        daemon delegates the intent to a configured Hermes HTTP endpoint
+        and treats the response as the agent result. In either model,
+        agents have no direct access to the daemon&apos;s state; every
+        interaction goes through the daemon.
+      </p>
+
+      <h2>Request lifecycle</h2>
+
+      <ol>
+        <li>
+          A client (CLI, TUI, web UI, third-party caller) sends a{" "}
+          <code>SubmitIntent</code> request over the Unix socket or HTTP.
+        </li>
+        <li>
+          The daemon checks the intent text against the configured
+          ignore set; matches are short-circuited with an
+          <code>IntentIgnored</code> audit event and skipped.
+        </li>
+        <li>
+          The router scores the intent against registered agent
+          capability cards via keyword overlap and selects the best
+          match (or falls back to an echo response).
+        </li>
+        <li>
+          The daemon runs a capability check for the matched agent&apos;s
+          required actions. The check writes a{" "}
+          <code>CapabilityCheck</code> audit event regardless of outcome.
+          A failed check rejects the dispatch with{" "}
+          <code>Response::Error</code>.
+        </li>
+        <li>
+          On success, the runtime spawns the agent, sends the intent on
+          stdin, reads the result on stdout, and enforces the budget
+          via both the wall-clock kill at <code>cpu_ms_per_task</code>{" "}
+          and the periodic projection tick that preempts via{" "}
+          <code>SIGTERM</code>/grace/<code>SIGKILL</code> on projected
+          overshoot.
+        </li>
+        <li>
+          The daemon writes a working-tier <code>MemoryRecord</code>{" "}
+          (with an embedding vector if an embedder is configured), a{" "}
+          <code>SettlementReceipt</code> for the resources consumed,
+          and an <code>IntentDispatched</code> audit event.
+        </li>
+        <li>
+          The client receives an <code>IntentResult</code> with the
+          intent UUID, the result text, sources, and (when applicable)
+          the receipt.
+        </li>
+      </ol>
+
+      <h2>State on disk</h2>
+
+      <p>
+        Everything Noren remembers about its operations sits under{" "}
+        <code>$NOREN_HOME</code>. Default location is{" "}
+        <code>~/.noren</code>; override with the{" "}
+        <code>NOREN_HOME</code> environment variable.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Path</th>
+            <th>Format</th>
+            <th>Owner</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>
+              <code>identity/local.key</code>
+            </td>
+            <td>raw 32 bytes (ed25519 seed)</td>
+            <td>noren-identity</td>
+          </tr>
+          <tr>
+            <td>
+              <code>memory.db</code>
+            </td>
+            <td>SQLite</td>
+            <td>noren-memory</td>
+          </tr>
+          <tr>
+            <td>
+              <code>audit/events.jsonl</code>
+            </td>
+            <td>JSONL, append-only</td>
+            <td>noren-audit</td>
+          </tr>
+          <tr>
+            <td>
+              <code>audit/events.chain.jsonl</code>
+            </td>
+            <td>JSONL, append-only hash-chain sidecar</td>
+            <td>noren-audit</td>
+          </tr>
+          <tr>
+            <td>
+              <code>capabilities/granted.jsonl</code>
+            </td>
+            <td>JSONL, append-only</td>
+            <td>noren-permissions</td>
+          </tr>
+          <tr>
+            <td>
+              <code>capabilities/revoked.jsonl</code>
+            </td>
+            <td>JSONL, append-only (tombstones)</td>
+            <td>noren-permissions</td>
+          </tr>
+          <tr>
+            <td>
+              <code>peers/registry.jsonl</code>
+            </td>
+            <td>JSONL, append-only</td>
+            <td>noren-peer-auth</td>
+          </tr>
+          <tr>
+            <td>
+              <code>peers/operator.token</code>
+            </td>
+            <td>opaque token bytes, mode 0600</td>
+            <td>noren-peer-auth</td>
+          </tr>
+          <tr>
+            <td>
+              <code>receipts/working.jsonl</code>
+            </td>
+            <td>JSONL, append-only</td>
+            <td>noren-settlement</td>
+          </tr>
+          <tr>
+            <td>
+              <code>budget/ledger.jsonl</code>
+            </td>
+            <td>JSONL, append-only</td>
+            <td>noren-budget</td>
+          </tr>
+          <tr>
+            <td>
+              <code>budget/checkpoints.jsonl</code>
+            </td>
+            <td>JSONL, append-only</td>
+            <td>noren-budget</td>
+          </tr>
+          <tr>
+            <td>
+              <code>a2a/events.jsonl</code>
+            </td>
+            <td>JSONL, append-only (leased-queue mailbox)</td>
+            <td>noren-a2a</td>
+          </tr>
+          <tr>
+            <td>
+              <code>agents/&lt;name&gt;/agent.toml</code>
+            </td>
+            <td>TOML, one manifest per package directory</td>
+            <td>noren-router</td>
+          </tr>
+          <tr>
+            <td>
+              <code>secrets.toml</code>
+            </td>
+            <td>TOML</td>
+            <td>noren-llm, noren-tools, noren-mcp</td>
+          </tr>
+          <tr>
+            <td>
+              <code>.norenignore</code>
+            </td>
+            <td>gitignore-style patterns</td>
+            <td>noren-memory</td>
+          </tr>
+          <tr>
+            <td>
+              <code>runtime/gvisor</code>
+            </td>
+            <td>scratch directory</td>
+            <td>noren-runtime</td>
+          </tr>
+          <tr>
+            <td>
+              <code>sock</code>
+            </td>
+            <td>Unix domain socket</td>
+            <td>noren-ipc</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Crate layout</h2>
+
+      <p>
+        The daemon is composed from a number of small Rust crates, each
+        owning one primitive. Each crate exposes a trait + at least two
+        implementations (one for production, one in-memory for tests),
+        which keeps the daemon&apos;s wiring straightforward and the
+        test suite fast.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Crate</th>
+            <th>Role</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>
+              <code>noren-types</code>
+            </td>
+            <td>
+              Wire-level types shared by every other crate ({" "}
+              <code>Intent</code>, <code>AgentId</code>,{" "}
+              <code>Priority</code>, <code>MemoryRecord</code>,{" "}
+              <code>MemoryTier</code>, <code>Capability</code>,{" "}
+              <code>SettlementReceipt</code>).
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-manifest</code>
+            </td>
+            <td>
+              Parser and validator for <code>agent.toml</code> manifests.
+              Reads the <code>agent</code>, <code>capabilities</code>,{" "}
+              <code>resources</code>, <code>sandbox</code>,{" "}
+              <code>settlement</code>, and <code>hermes</code> sections;
+              parses <code>Runtime</code> (<code>python3</code>,{" "}
+              <code>node</code>, <code>rust-bin</code>, <code>hermes</code>),{" "}
+              <code>NetworkPolicy</code> (<code>off</code>,{" "}
+              <code>outbound-https-only</code>, <code>full</code>),{" "}
+              <code>SandboxBackend</code> (<code>trusted-local</code>,{" "}
+              <code>linux-gvisor</code>), <code>FilesystemPolicy</code>{" "}
+              (<code>read-only-package</code>, <code>ephemeral</code>,{" "}
+              <code>host</code>), and <code>HermesApprovalPolicy</code>{" "}
+              (<code>operator-prompt</code>, <code>auto-deny</code>,{" "}
+              <code>auto-once</code>); pins <code>RESERVED_NAMESPACES</code>{" "}
+              (<code>intent.</code>, <code>memory.</code>,{" "}
+              <code>identity.</code>, <code>tool.</code>, <code>agent.</code>)
+              for capability ids; and surfaces <code>ManifestError</code>{" "}
+              <code>Parse</code>, <code>Io</code>, and <code>Validation</code>.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-router</code>
+            </td>
+            <td>
+              <code>Router</code> over a <code>Vec</code> of{" "}
+              <code>AgentCard</code> with <code>route</code> doing
+              case-insensitive keyword-overlap matching and
+              insertion-order tie-breaking,{" "}
+              <code>find_by_id</code>/<code>register</code>/
+              <code>from_cards</code> helpers, and the{" "}
+              <code>RouteMatch</code> result type (<code>agent_id</code>{" "}
+              plus <code>score</code>); <code>load_agents_from_dir</code>{" "}
+              walks <code>$NOREN_HOME/agents/</code> for{" "}
+              <code>agent.toml</code> manifests and returns cards sorted
+              by manifest id for deterministic routing across hosts;{" "}
+              <code>RouterError::Io</code> and{" "}
+              <code>RouterError::Manifest</code> preserve the inner{" "}
+              <code>std::io::Error</code> and{" "}
+              <code>noren_manifest::ManifestError</code> via{" "}
+              <code>#[source]</code> for downstream retry-policy
+              downcasts.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-runtime</code>
+            </td>
+            <td>
+              <code>Runner</code> trait with <code>SubprocessRunner</code>,{" "}
+              <code>GvisorRunner</code>, and <code>HermesRunner</code>{" "}
+              implementations, a stdin/stdout JSON protocol, and per-task
+              budget enforcement via projection-tick preempt and a
+              wall-clock backstop.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-memory</code>
+            </td>
+            <td>
+              Three-tier memory store (working, episodic, long-term):{" "}
+              <code>MemoryStore</code> trait with SQLite-backed
+              persistence and an in-memory backend for tests, cosine
+              similarity search over embedded vectors, tier-scoped
+              purge, bounded compaction, and scoped repair commands.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-identity</code>
+            </td>
+            <td>
+              ed25519 identity: keypair generation, on-disk persistence,
+              signing, and verification helpers. It is the local identity for
+              capabilities, audit, and memory. EVM payments and attestations
+              use a separate secp256k1 key held by a sidecar signer.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-peer-auth</code>
+            </td>
+            <td>
+              Peer-token registry binding ipc/http callers to{" "}
+              <code>AgentId</code>s: per-agent random 32-byte tokens
+              with 6-char b58 prefix-only operator visibility (full
+              tokens never leave the daemon), jsonl-backed event log,
+              revocation tombstones with prefix-based discovery, and
+              live/revoked/all status-filter queries, plus an
+              in-memory backend for tests.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-permissions</code>
+            </td>
+            <td>
+              Capability-token primitive: ed25519-signed{" "}
+              <code>SignedCapability</code>s over a deterministic
+              canonical message, persistent JSONL and in-memory{" "}
+              <code>CapabilityStore</code> backends, revocation
+              tombstones, and verify-with-clock for expiry. Plus
+              grant-time scope validation and dispatch-time scope
+              predicates for tool-call argument allowlists, before-ms
+              cutoffs, and per-namespace memory, A2A, peer, chain, and
+              audit-purge enforcement.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-audit</code>
+            </td>
+            <td>
+              Append-only audit log: <code>AuditLog</code> trait with
+              JSONL and in-memory backends, per-event hash-chain
+              integrity verification surfaced via{" "}
+              <code>verify_integrity</code>, and recorded event kinds
+              spanning intent dispatch, capability checks/grants/rejections,
+              budget enforcement, agent-to-agent messaging, tool approval
+              and invocation, memory maintenance, peer and operator
+              administration, and authentication failures.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-settlement</code>
+            </td>
+            <td>
+              Settlement primitive implementing the credits-and-buyback
+              model: <code>Settlement</code> trait with in-memory and
+              JSONL receipt-store backends; receipts accumulate in a
+              local JSONL log until batched and, once the Robinhood Chain
+              contracts ship (coming soon), flushed on-chain, at which point each receipt&apos;s{" "}
+              <code>onchain_sig</code> is populated.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-budget</code>
+            </td>
+            <td>
+              Per-agent token-bucket budget ledger:{" "}
+              <code>BudgetLedger</code> trait with in-memory and
+              JSONL-backed event-log backends, a separate pause/resume
+              checkpoint store, and bounded compaction that emits
+              per-agent Snapshot events at the cutoff alongside debit
+              records and exhaustion signals.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-llm</code>
+            </td>
+            <td>
+              <code>Provider</code> trait with <code>MockProvider</code>,{" "}
+              <code>OllamaProvider</code>, <code>AnthropicProvider</code>,
+              and an OpenAI-compatible implementation, a separate{" "}
+              <code>Embedder</code> trait with <code>MockEmbedder</code>{" "}
+              and <code>OllamaEmbedder</code>, a{" "}
+              <code>ProviderConfig</code> reader for{" "}
+              <code>~/.noren/secrets.toml</code> and an{" "}
+              <code>EmbedderConfig</code> reader over the same file, and
+              a <code>pick_provider</code> helper that returns the
+              highest-priority configured backend, falling back to
+              Ollama if reachable and to <code>MockProvider</code>{" "}
+              otherwise.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-tools</code>
+            </td>
+            <td>
+              <code>SearchProvider</code> trait with{" "}
+              <code>MockSearch</code>, <code>BraveSearch</code>, and{" "}
+              <code>SerpApiSearch</code> implementations, a{" "}
+              <code>SearchConfig</code> reader for the{" "}
+              <code>[search]</code> section of <code>secrets.toml</code>,
+              and a <code>pick_search</code> helper that falls back to{" "}
+              <code>MockSearch</code> when nothing is configured.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-mcp</code>
+            </td>
+            <td>
+              Model Context Protocol integration: tool trait following
+              the public MCP wire shapes (<code>name</code>,{" "}
+              <code>description</code>, <code>inputSchema</code>,{" "}
+              <code>Content</code> blocks, <code>isError</code>) so the
+              same trait backs native Rust implementations and external
+              MCP servers, in-process registry, native tools, stdio
+              JSON-RPC 2.0 transport for external servers.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-a2a</code>
+            </td>
+            <td>
+              Agent-to-agent task and result envelopes; async Mailbox
+              trait with an in-memory backend and a durable JSONL-backed
+              implementation over a leased task queue, plus a
+              receiver-side idempotency cache, operator-facing repair
+              commands, and an opt-in auto-retry policy.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-ipc</code>
+            </td>
+            <td>
+              Length-prefixed JSON IPC for the local socket: 4-byte
+              big-endian length prefix, frames bounded at 8 MB via{" "}
+              <code>MAX_FRAME</code>, and a versioned protocol shape (v1
+              baseline, v2 reserved for streaming responses).
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>norend</code>
+            </td>
+            <td>
+              The daemon binary. Wires the primitives together and
+              exposes intent dispatch, agent runtime, memory, identity,
+              permissions, audit, and settlement over a Unix socket and
+              an HTTP gateway.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren</code>
+            </td>
+            <td>
+              The CLI binary. Submits intents and drives memory,
+              capabilities, receipts, chain, audit, tools, A2A, and
+              peer-registry surfaces over the local IPC socket.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>noren-tui</code>
+            </td>
+            <td>
+              Terminal UI binary with intent, memory, audit, capabilities,
+              A2A, chain-receipts, and peer-registry views over the daemon
+              IPC.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Settlement</h2>
+      <p>
+        Noren records local settlement receipts today. The settlement chain is
+        Robinhood Chain (chain id 4663; USDG; ETH for gas). The Solidity contracts
+        (spend-grant escrow, bond-receipt and reputation verifiers, trade guards)
+        are in the repository with Foundry tests but are <strong>not deployed</strong>;
+        deployment is coming soon (see <Link href="/settlement">Settlement</Link>).
+        The daemon-driven per-intent settlement lifecycle and provider-payout flows
+        are not yet production.
+      </p>
+
+      <p>
+        The design boundary is deliberate: local receipts make resource
+        accounting inspectable while the on-chain authority surface is still
+        being built.
+      </p>
+
+      <h2>Position in the stack</h2>
+      <p>
+        Noren operates between the host operating system and user-facing
+        agentic applications. It does not host language models and does not
+        prescribe agent reasoning strategies. Custom agents, framework-built
+        agents, and end-to-end fine-tuned agents integrate against the same
+        primitive set, so that identity, permissions, memory, communication,
+        and settlement are provided as shared host-level services rather
+        than reimplemented per application.
+      </p>
+    </>
+  );
+}

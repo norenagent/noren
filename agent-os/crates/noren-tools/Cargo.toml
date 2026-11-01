@@ -1,0 +1,21 @@
+[package]
+name = "noren-tools"
+version = "0.1.0"
+description = "Tool provider abstraction for Noren. `SearchProvider` trait with `MockSearch`, `BraveSearch`, and `SerpApiSearch` implementations, a `SearchConfig` reader for the `[search]` section of `secrets.toml`, and a `pick_search` helper that returns the configured provider, falling back to `MockSearch` when nothing is configured."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = "0.6"

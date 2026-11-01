@@ -1,0 +1,9 @@
+{
+  "kind": "protocol_info",
+  "info": {
+    "protocol": "noren.ipc",
+    "version": 1,
+    "min_supported": 1,
+    "max_supported": 2
+  }
+}

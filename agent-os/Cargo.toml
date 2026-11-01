@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/noren-types",
+    "crates/noren-manifest",
+    "crates/noren-ipc",
+    "crates/noren-sdk",
+    "crates/noren-router",
+    "crates/noren-runtime",
+    "crates/noren-memory",
+    "crates/noren-settlement",
+    "crates/noren-llm",
+    "crates/noren-tools",
+    "crates/noren-identity",
+    "crates/noren-attestation",
+    "crates/noren-evm-signer",
+    "crates/noren-evm-firewall",
+    "crates/noren-rwa-firewall",
+    "crates/noren-spend-permission",
+    "crates/noren-audit",
+    "crates/noren-permissions",
+    "crates/noren-mcp",
+    "crates/noren-a2a",
+    "crates/noren-peer-auth",
+    "crates/noren-budget",
+    "crates/noren-x402",
+    "crates/noren-x402-signer-evm",
+    "crates/noren-acedata",
+    "crates/noren-robinhood",
+    "crates/noren-timeline-adapter",
+    "crates/noren-tee",
+    "crates/noren-bond",
+    "crates/norend",
+    "crates/noren",
+    "crates/noren-tui",
+    "agents/demo",
+    "agents/research",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Noren contributors"]
+repository = "https://github.com/norenagent/noren"
+homepage = "https://usenoren.xyz"
+readme = "README.md"
+
+[profile.release]
+overflow-checks = true
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_jcs = "0.2"
+toml = "0.8"
+thiserror = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+bs58 = "0.5"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "signal", "time", "process", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+parking_lot = "0.12"
+rusqlite = { version = "0.31", features = ["bundled"] }
+subtle = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ed25519-dalek = "2"
+k256 = "0.14"
+sha3 = "0.10"
+rand = "0.9"
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+sha2 = "0.11"
+borsh = { version = "1", features = ["derive"] }
+futures = "0.3"
+libc = "0.2"
+crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.30"

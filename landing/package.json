@@ -1,0 +1,54 @@
+{
+  "name": "noren-landing",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --turbopack -p 3001",
+    "build": "next build && node scripts/check-cards.mjs",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "check:cards": "node scripts/check-cards.mjs",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "lucide-react": "^0.460.0",
+    "next": "16.4.3",
+    "react": "19.2.9",
+    "react-dom": "19.2.9",
+    "sharp": "0.35.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.0",
+    "@types/node": "^25",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^4.3.0",
+    "typescript": "6.0.3",
+    "vitest": "^4.1.5"
+  },
+  "pnpm": {
+    "overrides": {
+      "axios": "1.20.0",
+      "browserslist": "4.28.7",
+      "follow-redirects": "1.16.1",
+      "image-size": "2.0.3",
+      "ip-address": "10.3.1",
+      "lodash": "4.18.1",
+      "protobufjs": "7.6.6",
+      "shell-quote": "1.11.0",
+      "socket.io-parser": "4.2.7",
+      "source-map-js": "1.2.2",
+      "toml": "5.0.1",
+      "ws@8.18.0": "8.21.0",
+      "ws@8.20.1": "8.21.0"
+    },
+    "auditConfig": {
+      "ignoreGhsas": [
+        "GHSA-3gc7-fjrx-p6mg",
+        "GHSA-vfj7-8cjw-p6xm"
+      ]
+    }
+  }
+}

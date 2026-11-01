@@ -1,0 +1,27 @@
+{
+  "name": "noren-pay",
+  "version": "0.1.0",
+  "description": "Let an agent pay for APIs in USDG on Robinhood Chain over x402. A skill that teaches the flow, plus the Noren MCP server.",
+  "author": {
+    "name": "Noren",
+    "url": "https://usenoren.xyz"
+  },
+  "homepage": "https://docs.usenoren.xyz/mcp-server",
+  "repository": "https://github.com/norenagent/noren",
+  "license": "Apache-2.0",
+  "keywords": [
+    "x402",
+    "payments",
+    "usdg",
+    "robinhood-chain",
+    "mcp",
+    "agents"
+  ],
+  "mcpServers": {
+    "noren": {
+      "type": "http",
+      "url": "https://mcp.usenoren.xyz/mcp"
+    }
+  },
+  "privacyPolicyUrl": "https://usenoren.xyz/privacy"
+}

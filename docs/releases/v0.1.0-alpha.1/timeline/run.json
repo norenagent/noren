@@ -1,0 +1,113 @@
+{
+  "schema": "noren.timeline.run.v0alpha3",
+  "contract": {
+    "schema": "noren.timeline.contract.v0alpha3",
+    "id": "noren.release.v0.1.0-alpha.1.temporal.v1",
+    "subject": {
+      "kind": "release",
+      "id": "norenagent/noren/v0.1.0-alpha.1"
+    },
+    "axes": [
+      {
+        "id": "unix-ms",
+        "kind": "metric",
+        "unit": "millisecond",
+        "origin": "unix.epoch"
+      }
+    ],
+    "contexts": [
+      {
+        "id": "actual",
+        "mode": "actual"
+      }
+    ]
+  },
+  "events": [
+    {
+      "type": "point.declared",
+      "schema": "noren.timeline.event.v0alpha3",
+      "id": "event.release-publication-point",
+      "sequence": 0,
+      "point": {
+        "id": "artifacts-published",
+        "contextId": "actual",
+        "axisId": "unix-ms"
+      }
+    },
+    {
+      "type": "point.declared",
+      "schema": "noren.timeline.event.v0alpha3",
+      "id": "event.tagged-commit-readiness-point",
+      "sequence": 1,
+      "point": {
+        "id": "tagged-commit-readiness-recorded",
+        "contextId": "actual",
+        "axisId": "unix-ms"
+      }
+    },
+    {
+      "type": "coordinate.asserted",
+      "schema": "noren.timeline.event.v0alpha3",
+      "id": "event.release-publication-provisional",
+      "sequence": 2,
+      "assertion": {
+        "id": "release.publication.provisional.v1",
+        "contextId": "actual",
+        "pointId": "artifacts-published",
+        "coordinate": {
+          "minimum": 1779957192000,
+          "maximum": 1779957192000
+        },
+        "evidenceRefs": [
+          "sha256:1cdde616e04c843b9dd521356f44e923704382f91ccc2d24f7c8d186fe274248"
+        ]
+      }
+    },
+    {
+      "type": "coordinate.asserted",
+      "schema": "noren.timeline.event.v0alpha3",
+      "id": "event.tagged-commit-readiness",
+      "sequence": 3,
+      "assertion": {
+        "id": "release.tagged-commit-readiness.v1",
+        "contextId": "actual",
+        "pointId": "tagged-commit-readiness-recorded",
+        "coordinate": {
+          "minimum": 1779957705698,
+          "maximum": 1779957705698
+        },
+        "evidenceRefs": [
+          "sha256:7cb78469f64d2dc414b6ee684c6ba109f759e877e7d2ec2288a5ea6101b0072c"
+        ]
+      }
+    },
+    {
+      "type": "coordinate.asserted",
+      "schema": "noren.timeline.event.v0alpha3",
+      "id": "event.release-publication-authoritative",
+      "sequence": 4,
+      "assertion": {
+        "id": "release.publication.github.v1",
+        "contextId": "actual",
+        "pointId": "artifacts-published",
+        "coordinate": {
+          "minimum": 1779957345000,
+          "maximum": 1779957345000
+        },
+        "evidenceRefs": [
+          "sha256:3acee9a24411590689ba843440182349ca38126efb48cc248a0fea2242d115cb"
+        ]
+      }
+    },
+    {
+      "type": "assertion.retracted",
+      "schema": "noren.timeline.event.v0alpha3",
+      "id": "event.release-publication-reconciled",
+      "sequence": 5,
+      "assertionId": "release.publication.provisional.v1",
+      "evidenceRefs": [
+        "sha256:3acee9a24411590689ba843440182349ca38126efb48cc248a0fea2242d115cb"
+      ]
+    }
+  ]
+}

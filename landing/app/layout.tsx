@@ -1,0 +1,180 @@
+import type { Metadata, Viewport } from "next";
+import { Hanken_Grotesk, JetBrains_Mono } from "next/font/google";
+import "./globals.css";
+import { SITE_URL } from "./_brand";
+import { GlassBackdrop } from "./GlassBackdrop";
+
+// Display + body: Hanken Grotesk, heavy for headlines. The mono is for code and labels.
+const hanken = Hanken_Grotesk({
+  subsets: ["latin"],
+  weight: ["400", "500", "600", "800"],
+  display: "swap",
+  variable: "--font-hanken",
+});
+
+const jetbrains = JetBrains_Mono({
+  subsets: ["latin"],
+  weight: ["300", "400", "500", "600"],
+  display: "swap",
+  variable: "--font-jetbrains",
+});
+
+const SITE_NAME = "Noren";
+const TITLE = "Noren: open agent-native operating layer";
+const DESCRIPTION =
+  "Noren is the open operating layer for people and AI agents, with runtime, memory, identity, permissions, intent, communication and settlement built in.";
+
+export const metadata: Metadata = {
+  metadataBase: new URL(SITE_URL),
+  title: TITLE,
+  description: DESCRIPTION,
+  applicationName: SITE_NAME,
+  alternates: { canonical: "/" },
+  openGraph: {
+    type: "website",
+    url: SITE_URL,
+    siteName: SITE_NAME,
+    title: TITLE,
+    description: DESCRIPTION,
+    images: [
+      {
+        url: "/opengraph-image.jpg",
+        width: 1200,
+        height: 630,
+        alt: "Noren: open agent-native operating layer",
+      },
+    ],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: TITLE,
+    description: DESCRIPTION,
+    images: [
+      {
+        url: "/twitter-image.jpg",
+        alt: "Noren: open agent-native operating layer",
+      },
+    ],
+  },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: {
+      index: true,
+      follow: true,
+      "max-image-preview": "large",
+      "max-snippet": -1,
+      "max-video-preview": -1,
+    },
+  },
+  appleWebApp: {
+    capable: true,
+    title: "Noren",
+    statusBarStyle: "default",
+  },
+  formatDetection: { telephone: false, address: false, email: false },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  themeColor: "#c4edc9",
+  colorScheme: "light",
+  viewportFit: "cover",
+};
+
+function SiteJsonLd() {
+  const graph = {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Organization",
+        "@id": `${SITE_URL}/#org`,
+        name: SITE_NAME,
+        alternateName: "Noren",
+        url: SITE_URL,
+        logo: `${SITE_URL}/noren-mark.png`,
+        description: DESCRIPTION,
+        foundingDate: "2026",
+        contactPoint: {
+          "@type": "ContactPoint",
+          contactType: "customer support",
+          url: `${SITE_URL}/contact`,
+        },
+      },
+      {
+        "@type": "WebSite",
+        "@id": `${SITE_URL}/#website`,
+        name: SITE_NAME,
+        url: SITE_URL,
+        description: DESCRIPTION,
+        inLanguage: "en",
+        publisher: { "@id": `${SITE_URL}/#org` },
+      },
+      {
+        "@type": "SoftwareApplication",
+        "@id": `${SITE_URL}/#software`,
+        name: SITE_NAME,
+        description: DESCRIPTION,
+        url: SITE_URL,
+        applicationCategory: "DeveloperApplication",
+        applicationSubCategory: "Agent operating layer",
+        operatingSystem: "Linux, macOS",
+        programmingLanguage: "Rust",
+        license: "https://www.apache.org/licenses/LICENSE-2.0",
+        isAccessibleForFree: true,
+        featureList: [
+          "Intent dispatch",
+          "Sandboxed runtime",
+          "Tiered semantic memory",
+          "ed25519 identity",
+          "Capability tokens",
+          "MCP and A2A comms",
+          "Audit log",
+          "On-chain settlement on Robinhood Chain",
+        ],
+        maintainer: { "@id": `${SITE_URL}/#org` },
+        author: { "@id": `${SITE_URL}/#org` },
+        publisher: { "@id": `${SITE_URL}/#org` },
+        offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+      },
+    ],
+  };
+  return (
+    <script
+      type="application/ld+json"
+      dangerouslySetInnerHTML={{ __html: JSON.stringify(graph) }}
+    />
+  );
+}
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en" className={`${hanken.variable} ${jetbrains.variable}`} suppressHydrationWarning>
+      <head>
+        <SiteJsonLd />
+        <script
+          // Static string, no user input: sets the theme class before first paint. // noren-gate: allow
+          dangerouslySetInnerHTML={{ // noren-gate: allow
+            __html:
+              "try{var l=location;document.documentElement.classList.add('glass-site')}catch(e){}",
+          }}
+        />
+      </head>
+      <body className="min-h-screen bg-ground text-fg antialiased">
+        <a
+          href="#main-content"
+          className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-full focus:border focus:border-line-strong focus:bg-raised focus:px-4 focus:py-2 focus:text-[13px] focus:font-semibold focus:text-fg"
+        >
+          Skip to main content
+        </a>
+        <GlassBackdrop />
+        {children}
+      </body>
+    </html>
+  );
+}

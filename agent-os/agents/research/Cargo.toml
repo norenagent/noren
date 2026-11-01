@@ -1,0 +1,23 @@
+[package]
+name = "research-agent"
+version = "0.1.0"
+description = "Research agent for Noren. Performs a web search and summarises the results via the configured LLM provider."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "research"
+path = "src/main.rs"
+
+[dependencies]
+noren-llm = { path = "../../crates/noren-llm" }
+noren-tools = { path = "../../crates/noren-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tempfile = { workspace = true }

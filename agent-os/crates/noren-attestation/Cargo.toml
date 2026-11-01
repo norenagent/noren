@@ -1,0 +1,27 @@
+[package]
+name = "noren-attestation"
+version = "0.1.0"
+description = "Wraps a Noren audit-chain root as a portable, dual-signed W3C Verifiable Credential: an eddsa-jcs-2022 Data Integrity proof (canonical) plus a secp256k1/EIP-712 proof (cheaply verifiable by an EVM contract). The same statement the daemon anchors on Robinhood Chain, made verifiable off-chain and on EVM without a bridge."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+noren-identity = { path = "../noren-identity" }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+k256 = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+bs58 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_jcs = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+noren-audit = { path = "../noren-audit" }
+noren-types = { path = "../noren-types" }
+uuid = { workspace = true }
+tokio = { workspace = true }

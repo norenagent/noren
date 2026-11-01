@@ -1,0 +1,105 @@
+# Release Artifact Provenance Subjects
+
+Noren provenance envelopes currently bind autonomy task evidence to a Git commit (`noren.provenance.v1`). Releases need an additional subject shape so a future signed release can bind:
+
+- the release identifier (tag or release id);
+- the canonical source commit;
+- the published artifacts and their digests;
+- the validation evidence captured at release time.
+
+This document defines the **subject schema** for that future release envelope without choosing key custody, publishing, or signing policy.
+
+## Goals
+
+- Make release artifacts addressable by stable digests (at minimum SHA-256).
+- Bind every artifact to one canonical source commit and repository.
+- Keep room for multiple artifact formats (tarballs, zips, SBOMs, checksums, signatures) without overclaiming trust.
+- Keep key custody and publication as explicitly human-governed work.
+
+## Definitions
+
+- **Release id**: a repository-scoped identifier such as a Git tag (`v0.1.0`) or a build id chosen by the release operator.
+- **Artifact**: a release output such as a source tarball, prebuilt binary, container digest, SBOM, or checksums file.
+- **Digest**: a cryptographic hash over the artifact bytes (SHA-256 for v1).
+
+## Proposed subject kinds
+
+### `git_tag`
+
+A lightweight subject for tying a tag name to a canonical commit:
+
+- `repository`: `owner/name`
+- `tag`: tag name
+- `commit`: canonical commit hash
+
+This does not describe artifacts; it is a building block for the release bundle.
+
+### `release_bundle` (planned)
+
+A release bundle subject binds a release id to a commit and a set of artifact digests.
+
+Required fields:
+
+- `repository`: `owner/name`
+- `releaseId`: string
+- `tag`: optional tag name (when the release is tag-based)
+- `commit`: canonical commit hash
+- `artifacts`: array of artifact descriptors
+
+Each artifact descriptor must include:
+
+- `name`: stable logical name (e.g. `noren-linux-amd64`)
+- `sha256`: lowercase hex digest
+- `sizeBytes`: integer byte count
+
+Optional artifact fields:
+
+- `filename`: published filename
+- `mediaType`: MIME type
+- `platform`: `{ os, arch }` for binaries
+- `uri`: published URL (informational; not trusted for verification)
+
+The release-subject verifier checks schema, repository, release id, commit, artifact names, relative filenames, SHA-256 digests, byte counts, and private-string hygiene. It does not sign, upload, publish, or write transparency-log entries. The verifier tooling is maintained internally.
+
+## Example (illustrative)
+
+```json
+{
+  "schema": "noren.provenance.release.v1",
+  "generatedAt": "2026-05-09T00:00:00.000Z",
+  "subject": {
+    "kind": "release_bundle",
+    "repository": "norenagent/noren",
+    "releaseId": "v0.1.0",
+    "tag": "v0.1.0",
+    "commit": "<40-hex>",
+    "artifacts": [
+      {
+        "name": "noren-source",
+        "filename": "noren-v0.1.0.tar.gz",
+        "sha256": "<64-hex>",
+        "sizeBytes": 123456
+      },
+      {
+        "name": "checksums",
+        "filename": "checksums.txt",
+        "sha256": "<64-hex>",
+        "sizeBytes": 987
+      }
+    ]
+  }
+}
+```
+
+## Non-claims
+
+- This schema does not claim that a release was published.
+- This schema does not claim that artifacts were produced by a trusted signer.
+- This schema does not define key custody or signature publication.
+
+Those remain release process work that must be explicitly documented and approved.
+
+## Related release-evidence artifacts
+
+- [release-scopes.md](./release-scopes.md) defines the sibling `noren.release-scope.v1` manifest, which binds a release to a digest of the integrated autonomy task set without exposing the task records.
+- [README.md](./README.md) documents how a single `noren.audit-root-attestation.v1` payload can embed both the release-subject digest (`releaseSubjectSha256`) and the release-scope digest (`releaseScopeSha256`), so one signature over the audit-root covers both the artifact set described here and the in-scope task set.

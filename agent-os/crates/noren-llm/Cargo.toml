@@ -1,0 +1,21 @@
+[package]
+name = "noren-llm"
+version = "0.1.0"
+description = "LLM provider abstraction for Noren. `Provider` trait with `MockProvider`, `OllamaProvider`, `AnthropicProvider`, and an OpenAI-compatible implementation, a separate `Embedder` trait with `MockEmbedder` and `OllamaEmbedder` implementations, a `ProviderConfig` reader for `~/.noren/secrets.toml`, and a `pick_provider` helper that returns the highest-priority configured backend, falling back to Ollama if reachable and to `MockProvider` otherwise."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = "0.6"

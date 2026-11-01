@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# noren-managed-pre-push
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+run_private_validator() {
+  local script="$1"
+  shift
+
+  if [ -f "$script" ]; then
+    node "$script" "$@" </dev/null
+  else
+    echo "pre-push: skipped $script (private workflow script not present)" >&2
+  fi
+}
+
+run_private_validator agent-os/scripts/validate-current-git-identity.mjs
+run_private_validator agent-os/scripts/validate-github-cli-account.mjs
+run_private_validator agent-os/scripts/validate-github-push-identity.mjs "${1:-origin}" "${2:-}"
+
+refs=()
+while read -r local_ref local_sha remote_ref remote_sha || [ -n "${local_ref:-}" ]; do
+  if [ -z "${local_ref:-}" ] || [ -z "${local_sha:-}" ]; then
+    continue
+  fi
+  if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+    continue
+  fi
+  if [ "${remote_sha:-}" = "0000000000000000000000000000000000000000" ] || [ -z "${remote_sha:-}" ]; then
+    refs+=(--rev "$local_sha")
+  else
+    refs+=(--rev "${remote_sha}..${local_sha}")
+  fi
+done
+
+if [ "${#refs[@]}" -eq 0 ]; then
+  upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+  if [ -n "$upstream" ]; then
+    refs+=(--rev "${upstream}..HEAD")
+  else
+    refs+=(--rev HEAD)
+  fi
+fi
+
+run_private_validator agent-os/scripts/validate-git-identity.mjs "${refs[@]}"

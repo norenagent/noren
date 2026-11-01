@@ -1,0 +1,13 @@
+{
+  "kind": "chain_status",
+  "status": {
+    "chain": "eip155:4663",
+    "cluster": "mainnet",
+    "rpc_url": null,
+    "ws_url": null,
+    "program_id": null,
+    "token_address": null,
+    "ready": false,
+    "missing": []
+  }
+}

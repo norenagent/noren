@@ -1,0 +1,25 @@
+{
+  "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
+  "name": "Noren Coding Sandbox",
+  "description": "Noren's public coding agent at sandbox.usenoren.xyz. It runs real coding tasks for anyone through a capability-gated, budgeted runtime, and every tool call and file write it brokers is recorded in an append-only, hash-chained audit log. Anchoring a signed audit-root attestation on Robinhood Chain is coming soon; nothing is anchored yet. Accountable, not just discoverable.",
+  "image": "https://usenoren.xyz/agents/noren-agent-1024.png",
+  "active": true,
+  "registrations": [
+    {
+      "agentId": "3hjDJy5LQ7NW19knFtC35VNouxNhaMcb7jqpneNRRAtt",
+      "agentRegistry": "eip155:4663:coming-soon"
+    }
+  ],
+  "services": [
+    {
+      "name": "web",
+      "endpoint": "https://sandbox.usenoren.xyz",
+      "skills": ["coding", "mcp-tools", "audit-log"]
+    },
+    {
+      "name": "web",
+      "endpoint": "https://usenoren.xyz",
+      "skills": ["identity", "verification", "audit-attestation"]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+[package]
+name = "noren-types"
+version = "0.1.0"
+description = "Core wire-level data types shared across the Noren workspace: Intent, AgentId, Priority, MemoryRecord, MemoryTier, Capability, and SettlementReceipt."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+bs58 = { workspace = true }
+thiserror = { workspace = true }

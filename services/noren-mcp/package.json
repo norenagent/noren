@@ -1,0 +1,52 @@
+{
+  "name": "noren-mcp",
+  "version": "0.3.0",
+  "mcpName": "xyz.usenoren/noren",
+  "description": "MCP server for Noren: x402 payments on Robinhood Chain, wallet reputation, gateway stats and governed pay-per-call APIs",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "noren-mcp": "dist/server.js",
+    "noren-mcp-http": "dist/http.js"
+  },
+  "keywords": [
+    "mcp",
+    "x402",
+    "robinhood-chain",
+    "usdg",
+    "agents",
+    "noren"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/norenagent/noren.git"
+  },
+  "homepage": "https://usenoren.xyz",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/server.js dist/http.js",
+    "start": "node dist/server.js",
+    "start:http": "node dist/http.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "lint": "echo skip",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ethers": "6.17.0",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@types/node": "25.6.0",
+    "typescript": "6.0.3",
+    "vitest": "^4.1.5"
+  }
+}

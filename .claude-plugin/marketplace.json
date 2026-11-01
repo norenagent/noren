@@ -1,0 +1,24 @@
+{
+  "name": "noren",
+  "owner": {
+    "name": "Noren"
+  },
+  "description": "Noren plugins for Claude Code.",
+  "version": "0.1.0",
+  "plugins": [
+    {
+      "name": "noren-pay",
+      "source": "./plugins/noren-pay",
+      "description": "Let an agent pay for APIs in USDG on Robinhood Chain over x402: a skill plus the Noren MCP server.",
+      "version": "0.1.0",
+      "category": "payments",
+      "keywords": [
+        "x402",
+        "payments",
+        "usdg",
+        "mcp",
+        "robinhood-chain"
+      ]
+    }
+  ]
+}

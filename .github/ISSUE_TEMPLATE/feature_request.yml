@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose a change to the public surface or a new capability.
+labels: ["feature", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Substantial changes to public APIs, capability shapes, or on-chain behavior benefit from an issue + discussion before implementation. Trivial improvements can go straight to a PR or direct push.
+
+  - type: input
+    id: scope
+    attributes:
+      label: Scope
+      description: Which component would this live in?
+      placeholder: "norend, noren-permissions, noren-mcp, programs/settlement, landing, etc."
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What's wrong today? What can't users do? Avoid jumping to solutions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How would this work? Include relevant types, wire shapes, capability requirements, and migration notes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else could solve this? Why is your proposal better?
+
+  - type: textarea
+    id: security_impact
+    attributes:
+      label: Security / release impact
+      description: Does this add or change identity, capability, audit, or settlement behavior? Note any review or rollout considerations.

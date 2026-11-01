@@ -1,0 +1,23 @@
+{
+  "name": "noren-pay",
+  "version": "0.1.0",
+  "description": "Pay x402 APIs on Robinhood Chain with one call. fetchPaid('slug') checks the challenge, enforces your spending caps, settles USDG and returns the data.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "keywords": ["x402", "robinhood-chain", "usdg", "agents", "payments", "noren"],
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/norenagent/noren.git", "directory": "services/noren-pay" },
+  "homepage": "https://usenoren.xyz",
+  "engines": { "node": ">=22" },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": { "ethers": "^6.17.0" },
+  "devDependencies": { "@types/node": "25.6.0", "typescript": "6.0.3", "vitest": "^4.1.5" }
+}

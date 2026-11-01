@@ -1,0 +1,185 @@
+//! Wire-format types for the x402 protocol.
+//!
+//! These mirror the JSON shape upstreams return in a 402 challenge.
+//! Field names match the wire ones via `#[serde(rename = …)]` so
+//! downstream consumers can round-trip the same object back through
+//! serde without translation.
+
+use serde::{Deserialize, Serialize};
+
+/// One payment option the upstream will accept.
+///
+/// Servers return an array of these in a 402 challenge body. Treat
+/// the array as "list of acceptable payment options" — any one
+/// suffices, not all of them. The client picks the first option
+/// whose `network` + `asset` match the supplied capability and whose
+/// `amount` is within the per-call cap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PaymentRequirements {
+    /// CAIP-2 chain identifier, e.g.
+    /// `"eip155:4663"` for Robinhood Chain mainnet.
+    pub network: String,
+    /// Token mint (Robinhood Chain) or contract address (EVM) the payment
+    /// must be denominated in. USDC is the common default.
+    pub asset: String,
+    /// Atomic amount as a decimal string. Stringified to preserve
+    /// precision across languages that lack u64.
+    pub amount: String,
+    /// Convenience field: the same amount expressed as USDC for
+    /// display and quick pre-flight comparison. Not authoritative —
+    /// `amount` + `asset` are.
+    #[serde(rename = "amountUsdc")]
+    pub amount_usdc: f64,
+    /// Destination address for the payment.
+    #[serde(rename = "payTo")]
+    pub pay_to: String,
+    /// x402 scheme. `"exact"` means the agent must pay this amount
+    /// exactly; forward-defined schemes (e.g. `"upto"`) are opaque
+    /// strings until the client grows explicit support.
+    pub scheme: String,
+    /// Provider-specific extension fields off the 402 option's `extra`
+    /// block. Currently used to carry PayAI's sponsored-gas `feePayer`
+    /// so the signer can set the v0 message's payer slot. Optional and
+    /// `skip_serializing_if = "Option::is_none"` so the xona payload
+    /// shape on the wire stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<PaymentExtra>,
+}
+
+/// Provider-specific extension fields lifted off the 402 option's
+/// `extra` block. Only the fields the signer needs are typed; anything
+/// else upstream sends is dropped silently.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaymentExtra {
+    /// Sponsor's fee-payer pubkey for sponsored-gas Robinhood Chain flows
+    /// (currently PayAI). When set, the signer builds a v0
+    /// VersionedTransaction whose payer slot is this pubkey and
+    /// partial-signs as the funder only.
+    #[serde(rename = "feePayer", default, skip_serializing_if = "Option::is_none")]
+    pub fee_payer: Option<String>,
+    /// EIP-712 domain `name` for the EVM `exact` scheme (EIP-3009). x402
+    /// facilitators put the paying token's on-chain `name()` here so the
+    /// signer can build the `TransferWithAuthorization` domain separator
+    /// without an RPC round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// EIP-712 domain `version` for the EVM `exact` scheme — the token's
+    /// EIP-712 `version` string (USDC uses `"2"`). Paired with `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Per-request nonce for ER-settled (`exact-er`) payments. The
+    /// `EphemeralSigner` binds the on-chain consume to this request via
+    /// `receipt_hash = sha256(nonce)`; the facilitator checks the match and
+    /// rejects replays. Absent for SPL flows, so the on-wire shape there is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+}
+
+/// A daemon-issued authorization to call paid endpoints.
+///
+/// The daemon constructs one of these per (agent, provider) tuple
+/// and hands it to [`super::Client::request_paid`]. This struct only
+/// carries the per-call dimensions the HTTP layer needs to match a
+/// payment requirement. Per-day caps, total budgets, TTL, and
+/// endpoint allowlists live in the daemon's budget and permissions
+/// subsystems and are enforced before this struct is constructed.
+#[derive(Debug, Clone)]
+pub struct Capability {
+    /// Free-form provider tag (e.g. `"xona"`). Audit only — not
+    /// enforced at the HTTP layer.
+    pub provider: String,
+    /// CAIP-2 network the daemon can settle on. The client picks
+    /// a payment requirement whose `network` matches.
+    pub network: String,
+    /// Asset the daemon can pay in (mint or contract address).
+    pub asset: String,
+    /// Maximum atomic amount allowed for a single call. Any
+    /// requirement exceeding this is rejected before the signer is
+    /// invoked.
+    pub per_call_cap: u128,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact JSON shape the upstream registry serves, captured
+    /// from the Xona payload during integration design. If this
+    /// round-trip ever breaks, upstream changed the wire format.
+    const XONA_SAMPLE: &str = r#"[
+        {
+            "network": "eip155:4663",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "amount": "80000",
+            "amountUsdc": 0.08,
+            "payTo": "9VaDVp1Wb78G4Wm6VuTiMrpESjrUymXefQTHcJGRSTEA",
+            "scheme": "exact"
+        }
+    ]"#;
+
+    #[test]
+    fn decodes_upstream_sample() {
+        let parsed: Vec<PaymentRequirements> = serde_json::from_str(XONA_SAMPLE).expect("decode");
+        assert_eq!(parsed.len(), 1);
+        let r = &parsed[0];
+        assert_eq!(r.network, "eip155:4663");
+        assert_eq!(r.amount, "80000");
+        assert_eq!(r.amount_usdc, 0.08);
+        assert_eq!(r.scheme, "exact");
+    }
+
+    #[test]
+    fn round_trips_through_serde() {
+        let parsed: Vec<PaymentRequirements> = serde_json::from_str(XONA_SAMPLE).expect("decode");
+        let re_encoded = serde_json::to_string(&parsed).expect("encode");
+        let re_parsed: Vec<PaymentRequirements> =
+            serde_json::from_str(&re_encoded).expect("re-decode");
+        assert_eq!(parsed, re_parsed);
+    }
+
+    fn requirement(extra: Option<PaymentExtra>) -> PaymentRequirements {
+        PaymentRequirements {
+            network: "eip155:4663".into(),
+            asset: "usdg".into(),
+            amount: "80000".into(),
+            amount_usdc: 0.08,
+            pay_to: "9VaDVp1Wb78G4Wm6VuTiMrpESjrUymXefQTHcJGRSTEA".into(),
+            scheme: "exact".into(),
+            extra,
+        }
+    }
+
+    #[test]
+    fn extra_absent_is_omitted_from_wire() {
+        // skip_serializing_if keeps the on-wire shape byte-identical to upstreams
+        // that send no `extra` block: the key must be absent, not null.
+        let json = serde_json::to_value(requirement(None)).expect("encode");
+        assert!(
+            json.get("extra").is_none(),
+            "extra must be omitted when None, got {json}"
+        );
+    }
+
+    #[test]
+    fn fee_payer_uses_renamed_wire_key_and_round_trips() {
+        // feePayer carries PayAI's sponsor pubkey; the signer reads it to set the
+        // v0 payer slot. It must serialize under the renamed `feePayer` key, not
+        // the Rust `fee_payer`, and survive a round-trip unchanged.
+        let original = requirement(Some(PaymentExtra {
+            fee_payer: Some("2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4".into()),
+            ..Default::default()
+        }));
+        let json = serde_json::to_value(&original).expect("encode");
+        assert_eq!(
+            json["extra"]["feePayer"],
+            "2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4"
+        );
+        assert!(
+            json["extra"].get("fee_payer").is_none(),
+            "must use the renamed feePayer key, got {json}"
+        );
+        let round: PaymentRequirements = serde_json::from_value(json).expect("decode");
+        assert_eq!(round, original);
+    }
+}

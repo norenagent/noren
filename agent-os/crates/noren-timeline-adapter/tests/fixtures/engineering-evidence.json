@@ -1,0 +1,100 @@
+{
+  "runId": "noren.timeline.m3",
+  "contract": {
+    "schema": "noren.timeline.contract.v0alpha1",
+    "id": "noren.engineering.v0",
+    "subject": {
+      "kind": "repository",
+      "id": "norenagent/noren"
+    },
+    "checkpoints": [
+      {
+        "id": "pause-recorded",
+        "requirements": ["engineering.pause.recorded"]
+      },
+      {
+        "id": "resume-recorded",
+        "requirements": ["engineering.resume.recorded"]
+      },
+      {
+        "id": "review-complete",
+        "requirements": ["engineering.review.passed"]
+      },
+      {
+        "id": "release-ready",
+        "requirements": ["engineering.release.artifact-ready"],
+        "onAccept": {
+          "kind": "noren.capability.request",
+          "payloadRef": "release.publish"
+        }
+      }
+    ]
+  },
+  "observations": [
+    {
+      "id": "m0-pause",
+      "kind": "noren.provenance",
+      "producer": "noren.git",
+      "claims": ["engineering.pause.recorded"],
+      "checkpoint": "pause-recorded",
+      "payload": {
+        "schema": "noren.provenance.v1",
+        "subject": {
+          "kind": "git_commit",
+          "repository": "norenagent/noren",
+          "commit": "1bf183be97f27f69c111af43f4010af05abd56eb"
+        },
+        "task": {
+          "id": "noren-timeline",
+          "state": "integration-boundary"
+        }
+      }
+    },
+    {
+      "id": "m3-resume",
+      "kind": "noren.audit-event",
+      "producer": "noren.audit",
+      "claims": ["engineering.resume.recorded"],
+      "checkpoint": "resume-recorded",
+      "payload": {
+        "repository": "norenagent/noren",
+        "pullRequest": 119,
+        "headCommit": "b2bc36f5e3ce4d6ce7ea1848ff122f864502767c",
+        "status": "resumed"
+      }
+    },
+    {
+      "id": "m3-review",
+      "kind": "validation",
+      "producer": "noren.local",
+      "claims": ["engineering.review.passed"],
+      "checkpoint": "review-complete",
+      "payload": {
+        "checks": [
+          {
+            "command": "cargo test -p noren-timeline-adapter",
+            "status": "passed"
+          },
+          {
+            "command": "pnpm verify",
+            "repository": "norenagent/noren-timeline",
+            "status": "passed"
+          }
+        ]
+      }
+    },
+    {
+      "id": "m3-release",
+      "kind": "package",
+      "producer": "noren.local",
+      "claims": ["engineering.release.artifact-ready"],
+      "checkpoint": "release-ready",
+      "payload": {
+        "package": "@noren-org/timeline",
+        "version": "0.0.0-alpha.1",
+        "packDryRun": "passed",
+        "published": false
+      }
+    }
+  ]
+}

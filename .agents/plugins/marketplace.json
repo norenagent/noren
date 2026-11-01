@@ -1,0 +1,13 @@
+{
+  "name": "noren",
+  "owner": {
+    "name": "Noren"
+  },
+  "plugins": [
+    {
+      "name": "noren-pay",
+      "source": "./plugins/noren-pay",
+      "description": "Let a Codex agent pay for APIs in USDG on Robinhood Chain over x402: a skill plus the Noren MCP server."
+    }
+  ]
+}

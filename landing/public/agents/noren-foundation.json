@@ -1,0 +1,30 @@
+{
+  "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
+  "name": "Noren Foundation Agent",
+  "description": "The Noren Foundation's production agent, running on norend, the open-source agent operating system for accountable autonomy. Every action it takes passes a scoped capability check, debits an enforced budget, and is recorded in an append-only, hash-chained audit log. Anchoring signed audit-root attestations on Robinhood Chain is coming soon; nothing is anchored yet. Identity, permissions, and a tamper-evident audit trail: trust you can check, not claim.",
+  "image": "https://usenoren.xyz/agents/noren-agent-1024.png",
+  "active": true,
+  "registrations": [
+    {
+      "agentId": "4XtUrwvPWAzMGnsKenMpTMATXN3e2quJV11Jg2dab2dc",
+      "agentRegistry": "eip155:4663:coming-soon"
+    }
+  ],
+  "services": [
+    {
+      "name": "web",
+      "endpoint": "https://usenoren.xyz",
+      "skills": ["identity", "capabilities", "audit-attestation"]
+    },
+    {
+      "name": "web",
+      "endpoint": "https://sandbox.usenoren.xyz",
+      "skills": ["operator-console", "mcp-tools", "audit-log"]
+    },
+    {
+      "name": "web",
+      "endpoint": "https://docs.usenoren.xyz",
+      "skills": ["documentation"]
+    }
+  ]
+}

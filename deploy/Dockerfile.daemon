@@ -1,0 +1,52 @@
+## Multi-stage Dockerfile for norend in demo mode on Render.
+## Build context expected: repository root (so agent-os/, examples/, deploy/ are visible).
+## Final image runs norend as a private HTTP gateway. The companion
+## noren-demo-web service proxies browser traffic to it.
+
+FROM rust:1.90-slim-bookworm AS builder
+ENV CARGO_TERM_COLOR=always
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      pkg-config libssl-dev ca-certificates git \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY agent-os/ ./agent-os/
+WORKDIR /src/agent-os
+# Build the daemon, operator CLI, and the Haiku-backed demo agent; skip
+# the EVM contracts (Foundry not available, not
+# needed by the demo).
+RUN cargo build --release \
+      --bin norend \
+      --bin noren \
+      --bin demo
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates python3 curl jq \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash noren
+WORKDIR /home/noren
+
+COPY --from=builder /src/agent-os/target/release/norend /usr/local/bin/norend
+COPY --from=builder /src/agent-os/target/release/noren /usr/local/bin/noren
+
+# Demo seed bundle: Haiku-backed demo-agent package (manifest + binary) +
+# entrypoint that primes operator token, baseline capabilities, and waits
+# for daemon readiness.
+COPY examples/demo-agent /opt/noren/demo-agent
+COPY --from=builder /src/agent-os/target/release/demo /opt/noren/demo-agent/demo
+
+# Coder agent manifest (runtime=hermes; no local binary). The entrypoint seeds
+# it into $NOREN_HOME/agents only when HERMES_API_BASE_URL is configured.
+COPY examples/coder-agent /opt/noren/coder-agent
+COPY deploy/entrypoint.sh /usr/local/bin/noren-demo-entrypoint
+RUN chmod +x /usr/local/bin/noren-demo-entrypoint
+
+ENV NOREN_HOME=/data
+ENV NOREN_HTTP_PORT=8421
+ENV NOREN_HTTP_BIND_ADDR=0.0.0.0
+USER noren
+EXPOSE 8421
+ENTRYPOINT ["/usr/local/bin/noren-demo-entrypoint"]

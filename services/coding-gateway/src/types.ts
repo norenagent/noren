@@ -1,0 +1,170 @@
+export type MarketplaceRoute = 'marketplace' | 'per-request';
+
+/**
+ * Contract for the Noren coding gateway.
+ *
+ * The gateway implements the Hermes /v1 surface that norend's HermesRunner
+ * already speaks, so the daemon runtime layer is unchanged. Per run it
+ * provisions an ephemeral sandbox, drives a pluggable coding backend with
+ * file + bash tools bound to that sandbox, and maps backend events onto the
+ * Hermes SSE frames the daemon folds into its audit chain.
+ *
+ */
+
+// Hermes /v1 wire contract consumed by norend.
+
+export interface RunRequest {
+  input: string;
+  session_id: string;
+  max_cost_usd: number;
+  repository_url?: string;
+  base_sha?: string;
+  validation_commands?: string[];
+  initial_patch?: string;
+}
+
+export interface RunCreated {
+  run_id: string;
+}
+
+export type RunStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting_for_approval'
+  | 'stopping'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface RunState {
+  status: RunStatus;
+  output?: string;
+  error?: string;
+  usage?: TokenUsage;
+  costUsd?: number;
+  providerReceipts?: ProviderReceipt[];
+}
+
+/** GET /v1/capabilities — the three features the daemon gates on plus the
+ *  optional approval channel. */
+export interface GatewayCapabilities {
+  features: {
+    run_submission: boolean;
+    run_events_sse: boolean;
+    run_stop: boolean;
+    run_approval_response: boolean;
+  };
+}
+
+// SSE events exposed by GET /v1/runs/{id}/events.
+// norend maps tool.* and approval.* into RuntimeTrace audit rows;
+// message/reasoning/file are for the live UI (WS3) and ignored by the tracer.
+
+export type GatewayEvent =
+  | { type: 'tool.started'; tool: string; preview?: string }
+  | { type: 'tool.completed'; tool: string; duration_s?: number; error?: boolean }
+  | { type: 'file.written'; path: string; bytes: number }
+  | { type: 'message.delta'; text: string }
+  | { type: 'reasoning.available'; text: string }
+  | { type: 'approval.request'; choices: string[] }
+  | { type: 'run.completed'; output: string }
+  | { type: 'run.failed'; error: string };
+
+// Pluggable coding backend.
+// Anthropic and OpenAI adapters implement this; selected per run.
+
+export type BackendId = 'anthropic' | 'openai' | 'usepod';
+
+export interface ValidationResult {
+  command: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface RunArtifacts {
+  patch: string;
+  changedFiles: string[];
+  files: Array<{ path: string; content: string }>;
+  validations: ValidationResult[];
+}
+
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+}
+
+export interface ProviderAccounting {
+  accountedCostMicrounits: string;
+  basis: 'configured-price-ceilings' | 'max-of-configured-price-ceilings-and-provider-report';
+  inputTokens: number;
+  outputTokens: number;
+  inputPriceMicrounitsPerMillion: number;
+  outputPriceMicrounitsPerMillion: number;
+}
+
+export interface ProviderReceipt {
+  model: string;
+  /** The marketplace route that served the request: `per-request` today, `marketplace` historically. */
+  route: MarketplaceRoute;
+  balanceRemaining: string;
+  providerId?: string;
+  requestId?: string;
+  providerReportedCostMicrounits?: string;
+  accounting?: ProviderAccounting;
+  /** Accepted only when loading receipts written before accounted turn costs were introduced. */
+  costMicrounits?: string;
+}
+
+export type AccountedProviderReceipt = ProviderReceipt & { accounting: ProviderAccounting };
+
+export interface CodingBackend {
+  readonly id: BackendId;
+  run(opts: {
+    input: string;
+    sandbox: Sandbox;
+    signal: AbortSignal; // aborts on wall-clock budget or POST /stop
+    emit: (e: GatewayEvent) => void;
+    maxProviderCostUsd: number;
+    recordProviderRequest?: () => void | Promise<void>;
+    recordProviderReceipt?: (receipt: ProviderReceipt) => void | Promise<void>;
+  }): Promise<{ output: string; usage: TokenUsage; providerReceipts?: ProviderReceipt[] }>;
+}
+
+// Pluggable execution substrate. This is the untrusted-code security boundary.
+// E2B / Daytona / Modal adapter implements this.
+
+export interface SandboxProvider {
+  readonly id: string;
+  /** Non-billable credential/control-plane probe used by readiness. */
+  check?(): Promise<void>;
+  create(spec: SandboxSpec): Promise<Sandbox>;
+}
+
+export interface SandboxSpec {
+  runId: string;
+  /** Explicit subset of the operator policy that this run may reach. */
+  egressAllowlist: string[];
+  cpuMs: number;
+  memoryMb: number;
+  diskMb: number;
+  wallMs: number;
+}
+
+export interface Sandbox {
+  readFile(path: string): Promise<string>;
+  writeFile(path: string, content: string): Promise<void>;
+  exec(cmd: string, opts?: { timeoutMs?: number }): Promise<ExecResult>;
+  /** Public URL serving a port inside the sandbox — used to preview a built
+   *  web app in the UI (WS4). */
+  previewUrl(port: number): Promise<string>;
+  destroy(): Promise<void>;
+}
+
+export interface ExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}

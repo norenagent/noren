@@ -1,0 +1,5 @@
+#!/bin/sh
+# Noren pre-commit: block committed secrets and unreviewed dangerous patterns.
+# Install with: git config core.hooksPath .githooks
+ROOT="$(git rev-parse --show-toplevel)"
+exec python3 "$ROOT/scripts/noren-security-gate.py"

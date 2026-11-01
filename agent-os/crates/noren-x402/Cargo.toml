@@ -1,0 +1,57 @@
+[package]
+name = "noren-x402"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Outbound x402 client for Noren agents — capability-scoped paid HTTP."
+
+[features]
+default = []
+# In-process EIP-1559 tx submitter (evm_tx::EvmRpc). Adds only a tokio timer
+# for receipt polling; the sign/encode core is always built. The daemon turns
+# this on so norend can broadcast its own chargeCall/release/refund txs.
+evm-rpc = ["dep:tokio"]
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+url = "2"
+
+# EVM (Base) signer support. EIP-3009 TransferWithAuthorization signed via
+# EIP-712 is gasless and never touches an RPC, so it needs only secp256k1,
+# keccak, base64, and a CSPRNG for the authorization nonce — a negligible
+# tree next to the reqwest client the crate already carries. Kept out of the
+# Always built so the default
+# `cargo test -p noren-x402` exercises the payment path.
+base64 = "0.22"
+k256 = { workspace = true }
+sha3 = { workspace = true }
+rand = { workspace = true }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"], optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
+tempfile = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"
+
+[[test]]
+name = "live_evm_tx"
+required-features = ["evm-rpc"]
+
+# Live generic x402 USDG settlement on Robinhood Chain 4663 — signs an EIP-3009
+# authorization with EvmSigner and settles it with the in-process submitter, so
+# it also needs evm-rpc.
+[[test]]
+name = "live_rh_usdg_settlement"
+required-features = ["evm-rpc"]
